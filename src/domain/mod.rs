@@ -1,0 +1,289 @@
+//! Pure domain types.
+//!
+//! This module must not depend on `gpui` or `rusqlite`. Keeping it free of
+//! both is what lets it move into its own crate later without a rewrite.
+
+use std::fmt;
+use std::str::FromStr;
+
+use chrono::{DateTime, Utc};
+
+/// Issues are identified by a sequential integer, shown to the user as `#42`.
+pub type IssueId = i64;
+
+/// Returned when a `TEXT` column holds a value outside the known set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub kind: &'static str,
+    pub value: String,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unrecognised {}: {:?}", self.kind, self.value)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Where an Issue sits in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Status {
+    #[default]
+    Todo,
+    Doing,
+    Blocked,
+    Done,
+    Cancelled,
+}
+
+impl Status {
+    pub const ALL: [Status; 5] = [
+        Status::Todo,
+        Status::Doing,
+        Status::Blocked,
+        Status::Done,
+        Status::Cancelled,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Todo => "Todo",
+            Status::Doing => "Doing",
+            Status::Blocked => "Blocked",
+            Status::Done => "Done",
+            Status::Cancelled => "Cancelled",
+        }
+    }
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl FromStr for Status {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Status::ALL
+            .into_iter()
+            .find(|status| status.label() == s)
+            .ok_or_else(|| ParseError {
+                kind: "status",
+                value: s.to_owned(),
+            })
+    }
+}
+
+/// How much an Issue matters relative to others.
+///
+/// Variants are declared lowest-first so the derived `Ord` sorts naturally;
+/// the list view then sorts descending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum Priority {
+    #[default]
+    None,
+    Low,
+    Medium,
+    High,
+    Urgent,
+}
+
+impl Priority {
+    pub const ALL: [Priority; 5] = [
+        Priority::None,
+        Priority::Low,
+        Priority::Medium,
+        Priority::High,
+        Priority::Urgent,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Priority::None => "None",
+            Priority::Low => "Low",
+            Priority::Medium => "Medium",
+            Priority::High => "High",
+            Priority::Urgent => "Urgent",
+        }
+    }
+}
+
+impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl FromStr for Priority {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Priority::ALL
+            .into_iter()
+            .find(|priority| priority.label() == s)
+            .ok_or_else(|| ParseError {
+                kind: "priority",
+                value: s.to_owned(),
+            })
+    }
+}
+
+/// A single unit of tracked work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issue {
+    pub id: IssueId,
+    pub title: String,
+    pub body: String,
+    pub status: Status,
+    pub priority: Priority,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl Issue {
+    /// The title as displayed when the user hasn't typed one yet.
+    pub fn display_title(&self) -> &str {
+        if self.title.trim().is_empty() {
+            "Untitled"
+        } else {
+            &self.title
+        }
+    }
+}
+
+/// A named, predefined slice of all Issues, shown in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum View {
+    #[default]
+    All,
+    WithStatus(Status),
+}
+
+impl View {
+    pub const ALL: [View; 6] = [
+        View::All,
+        View::WithStatus(Status::Todo),
+        View::WithStatus(Status::Doing),
+        View::WithStatus(Status::Blocked),
+        View::WithStatus(Status::Done),
+        View::WithStatus(Status::Cancelled),
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            View::All => "All Issues",
+            View::WithStatus(status) => status.label(),
+        }
+    }
+
+    pub fn contains(self, issue: &Issue) -> bool {
+        match self {
+            View::All => true,
+            View::WithStatus(status) => issue.status == status,
+        }
+    }
+}
+
+/// Orders Issues for display: highest priority first, then most recently
+/// updated. Ties break on `id` so the order is never ambiguous.
+pub fn sort_for_display(issues: &mut [Issue]) {
+    issues.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then(b.updated_at.cmp(&a.updated_at))
+            .then(b.id.cmp(&a.id))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn issue(id: IssueId, priority: Priority, updated_at: &str) -> Issue {
+        let at = DateTime::parse_from_rfc3339(updated_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        Issue {
+            id,
+            title: format!("issue {id}"),
+            body: String::new(),
+            status: Status::Todo,
+            priority,
+            created_at: at,
+            updated_at: at,
+        }
+    }
+
+    #[test]
+    fn status_round_trips_through_text() {
+        for status in Status::ALL {
+            assert_eq!(status.to_string().parse::<Status>().unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn priority_round_trips_through_text() {
+        for priority in Priority::ALL {
+            assert_eq!(priority.to_string().parse::<Priority>().unwrap(), priority);
+        }
+    }
+
+    #[test]
+    fn unknown_text_is_rejected_rather_than_defaulted() {
+        assert!("Wontfix".parse::<Status>().is_err());
+        assert!("Critical".parse::<Priority>().is_err());
+    }
+
+    #[test]
+    fn priority_orders_none_lowest_and_urgent_highest() {
+        assert!(Priority::None < Priority::Low);
+        assert!(Priority::Urgent > Priority::High);
+    }
+
+    #[test]
+    fn all_view_contains_every_status() {
+        for status in Status::ALL {
+            let mut candidate = issue(1, Priority::None, "2026-01-01T00:00:00Z");
+            candidate.status = status;
+            assert!(View::All.contains(&candidate));
+        }
+    }
+
+    #[test]
+    fn status_view_contains_only_its_own_status() {
+        let view = View::WithStatus(Status::Blocked);
+        let mut blocked = issue(1, Priority::None, "2026-01-01T00:00:00Z");
+        blocked.status = Status::Blocked;
+        let todo = issue(2, Priority::None, "2026-01-01T00:00:00Z");
+
+        assert!(view.contains(&blocked));
+        assert!(!view.contains(&todo));
+    }
+
+    #[test]
+    fn display_orders_by_priority_then_recency() {
+        let mut issues = vec![
+            issue(1, Priority::Low, "2026-01-03T00:00:00Z"),
+            issue(2, Priority::Urgent, "2026-01-01T00:00:00Z"),
+            issue(3, Priority::Low, "2026-01-05T00:00:00Z"),
+        ];
+
+        sort_for_display(&mut issues);
+
+        // Urgent first despite being the oldest, then Low by recency.
+        assert_eq!(
+            issues.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+    }
+
+    #[test]
+    fn blank_titles_display_as_untitled() {
+        let mut candidate = issue(1, Priority::None, "2026-01-01T00:00:00Z");
+        candidate.title = "   ".into();
+        assert_eq!(candidate.display_title(), "Untitled");
+    }
+}
