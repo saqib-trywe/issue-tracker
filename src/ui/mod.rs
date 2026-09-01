@@ -6,6 +6,8 @@
 mod issue_detail;
 mod issue_list;
 mod sidebar;
+mod theme;
 mod tracker;
 
+pub use theme::apply_system_appearance;
 pub use tracker::{IssueTracker, init};

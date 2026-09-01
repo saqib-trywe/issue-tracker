@@ -32,6 +32,10 @@ fn main() -> anyhow::Result<()> {
                 ..Default::default()
             },
             |window, cx| {
+                // Before the first paint: gpui_component::init pins the theme
+                // to Light, so a dark-mode machine would otherwise flash white.
+                ui::apply_system_appearance(window, cx);
+
                 let view = cx.new(|cx| IssueTracker::new(store, window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             },

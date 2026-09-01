@@ -124,6 +124,9 @@ impl IssueTracker {
                     }
                 },
             ),
+            // Chrome rather than issues, but this is the only object that
+            // lives as long as the window, so it holds the subscription.
+            super::theme::observe_system_appearance(window),
         ];
 
         let mut this = Self {
