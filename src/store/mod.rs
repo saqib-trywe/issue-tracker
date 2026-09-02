@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 
 use crate::domain::{Issue, IssueId, Priority, Status};
 
@@ -113,6 +113,35 @@ impl Store {
             .execute("DELETE FROM issue WHERE id = ?1", rusqlite::params![id])?;
         Ok(())
     }
+
+    /// Reads a UI preference. `None` when it has never been set.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let value = self
+            .conn
+            .query_row(
+                "SELECT value FROM setting WHERE key = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    /// Writes a UI preference, replacing any existing value.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+}
+
+/// Preference keys. Values are theme display names as shown in the picker.
+pub mod settings_keys {
+    pub const THEME_LIGHT: &str = "theme.light";
+    pub const THEME_DARK: &str = "theme.dark";
 }
 
 /// The database file location: `$ISSUE_TRACKER_DB` when set, otherwise the
@@ -260,6 +289,60 @@ mod tests {
             format_timestamp(issue.created_at),
             format_timestamp(reloaded.created_at)
         );
+    }
+
+    #[test]
+    fn unset_setting_reads_as_none() {
+        assert_eq!(store().get_setting("theme.light").unwrap(), None);
+    }
+
+    #[test]
+    fn settings_round_trip() {
+        let store = store();
+        store.set_setting("theme.light", "Gruvbox Light").unwrap();
+        assert_eq!(
+            store.get_setting("theme.light").unwrap(),
+            Some("Gruvbox Light".to_string())
+        );
+    }
+
+    #[test]
+    fn setting_a_key_twice_overwrites_rather_than_failing() {
+        let store = store();
+        store.set_setting("theme.dark", "Gruvbox Dark").unwrap();
+        store.set_setting("theme.dark", "Tokyo Night").unwrap();
+
+        assert_eq!(
+            store.get_setting("theme.dark").unwrap(),
+            Some("Tokyo Night".to_string())
+        );
+    }
+
+    #[test]
+    fn settings_are_independent_of_each_other() {
+        let store = store();
+        store.set_setting("theme.light", "Solarized Light").unwrap();
+        store.set_setting("theme.dark", "Solarized Dark").unwrap();
+
+        assert_eq!(
+            store.get_setting("theme.light").unwrap(),
+            Some("Solarized Light".to_string())
+        );
+        assert_eq!(
+            store.get_setting("theme.dark").unwrap(),
+            Some("Solarized Dark".to_string())
+        );
+    }
+
+    #[test]
+    fn settings_do_not_disturb_issues() {
+        let store = store();
+        let issue = store.insert("unaffected").unwrap();
+        store.set_setting("theme.light", "Ayu Light").unwrap();
+
+        let issues = store.load_all().unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, issue.id);
     }
 
     #[test]

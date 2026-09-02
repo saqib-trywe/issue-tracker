@@ -7,8 +7,9 @@
 use rusqlite_migration::{M, Migrations};
 
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(
-        "CREATE TABLE issue (
+    Migrations::new(vec![
+        M::up(
+            "CREATE TABLE issue (
              id         INTEGER PRIMARY KEY,
              title      TEXT NOT NULL,
              body       TEXT NOT NULL DEFAULT '',
@@ -17,7 +18,17 @@ pub fn migrations() -> Migrations<'static> {
              created_at TEXT NOT NULL,
              updated_at TEXT NOT NULL
          );",
-    )])
+        ),
+        // UI preferences live here rather than in a config file so there is a
+        // single persistence mechanism, one file location, and one set of
+        // failure modes. See docs/adr/0003.
+        M::up(
+            "CREATE TABLE setting (
+             key   TEXT PRIMARY KEY,
+             value TEXT NOT NULL
+         );",
+        ),
+    ])
 }
 
 #[cfg(test)]

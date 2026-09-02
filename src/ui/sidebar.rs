@@ -2,8 +2,10 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::ActiveTheme;
+use gpui_component::select::{Select, SelectState};
+use gpui_component::{ActiveTheme, Sizable};
 
+use super::theme_catalogue::ThemeListDelegate;
 use super::tracker::IssueTracker;
 use crate::domain::View;
 
@@ -40,6 +42,59 @@ impl IssueTracker {
                 }
                 rows
             })
+            .child(self.render_appearance(cx))
+    }
+
+    /// Theme pickers, pinned to the foot of the sidebar.
+    ///
+    /// Two selectors and no mode switch: which theme applies is the user's
+    /// choice, but *when* dark applies stays with the OS.
+    fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .mt_auto()
+            .pt_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Appearance"),
+            )
+            .child(Self::render_theme_row("Light", &self.light_select, cx))
+            .child(Self::render_theme_row("Dark", &self.dark_select, cx))
+    }
+
+    fn render_theme_row(
+        label: &'static str,
+        state: &Entity<SelectState<ThemeListDelegate>>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        div()
+            .px_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
+            // With nothing stored the app uses gpui-component's built-in
+            // theme, which is not one of the embedded files and so has no row
+            // to select. "Default" is the honest label for that state.
+            .child(
+                Select::new(state)
+                    .small()
+                    .placeholder("Default")
+                    .menu_width(px(200.0)),
+            )
     }
 
     fn render_view_row(

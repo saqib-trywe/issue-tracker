@@ -6,8 +6,12 @@ use std::time::Duration;
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState, TextareaState};
 
+use gpui_component::ThemeMode;
+use gpui_component::select::{SelectEvent, SelectState};
+
+use super::theme_catalogue::{ThemeCatalogue, ThemeListDelegate};
 use crate::domain::{Issue, IssueId, Priority, Status, View, sort_for_display};
-use crate::store::Store;
+use crate::store::{Store, settings_keys};
 
 /// How long editing pauses before an auto-save fires.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
@@ -29,6 +33,18 @@ actions!(
         CancelEditing,
     ]
 );
+
+/// Reads a preference, treating a read failure as "unset" — a broken settings
+/// row should cost you a theme, not the app.
+fn read_setting(store: &Store, key: &str) -> Option<String> {
+    match store.get_setting(key) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("failed to read setting {key}: {err:#}");
+            None
+        }
+    }
+}
 
 /// Registers key bindings. Called once at startup.
 pub fn init(cx: &mut App) {
@@ -65,6 +81,13 @@ pub struct IssueTracker {
     /// Replaced on every keystroke; dropping the previous task cancels it,
     /// which is what makes the save debounced.
     save_task: Option<Task<()>>,
+
+    /// Every embedded theme, split by mode. Held so a selection can be
+    /// resolved back to the config it applies.
+    catalogue: ThemeCatalogue,
+    pub(super) light_select: Entity<SelectState<ThemeListDelegate>>,
+    pub(super) dark_select: Entity<SelectState<ThemeListDelegate>>,
+
     /// Subscriptions die with the view if not held here.
     _subscriptions: Vec<Subscription>,
 }
@@ -84,6 +107,37 @@ impl IssueTracker {
                 .auto_grow(8, 40)
                 .placeholder("Describe the work…")
         });
+        // Themes: resolve the persisted choices, falling back to the built-in
+        // defaults so a first run looks exactly as it did before this feature.
+        let catalogue = ThemeCatalogue::load();
+        let stored_light = read_setting(&store, settings_keys::THEME_LIGHT);
+        let stored_dark = read_setting(&store, settings_keys::THEME_DARK);
+
+        let light_config = stored_light
+            .as_deref()
+            .and_then(|name| catalogue.find(ThemeMode::Light, name))
+            .map(|choice| choice.config.clone());
+        let dark_config = stored_dark
+            .as_deref()
+            .and_then(|name| catalogue.find(ThemeMode::Dark, name))
+            .map(|choice| choice.config.clone());
+
+        if light_config.is_some() || dark_config.is_some() {
+            super::theme::apply_themes(light_config, dark_config, window, cx);
+        }
+
+        let light_delegate = ThemeListDelegate::new(catalogue.for_mode(ThemeMode::Light).to_vec());
+        let dark_delegate = ThemeListDelegate::new(catalogue.for_mode(ThemeMode::Dark).to_vec());
+        let light_index = stored_light
+            .as_deref()
+            .and_then(|name| light_delegate.index_of(name));
+        let dark_index = stored_dark
+            .as_deref()
+            .and_then(|name| dark_delegate.index_of(name));
+
+        let light_select = cx.new(|cx| SelectState::new(light_delegate, light_index, window, cx));
+        let dark_select = cx.new(|cx| SelectState::new(dark_delegate, dark_index, window, cx));
+
         let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter titles…"));
         let new_issue_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("New issue title…"));
@@ -124,6 +178,26 @@ impl IssueTracker {
                     }
                 },
             ),
+            cx.subscribe_in(
+                &light_select,
+                window,
+                |this, _, event: &SelectEvent<ThemeListDelegate>, window, cx| {
+                    let SelectEvent::Confirm(Some(name)) = event else {
+                        return;
+                    };
+                    this.choose_theme(ThemeMode::Light, &name.clone(), window, cx);
+                },
+            ),
+            cx.subscribe_in(
+                &dark_select,
+                window,
+                |this, _, event: &SelectEvent<ThemeListDelegate>, window, cx| {
+                    let SelectEvent::Confirm(Some(name)) = event else {
+                        return;
+                    };
+                    this.choose_theme(ThemeMode::Dark, &name.clone(), window, cx);
+                },
+            ),
             // Chrome rather than issues, but this is the only object that
             // lives as long as the window, so it holds the subscription.
             super::theme::observe_system_appearance(window),
@@ -142,6 +216,9 @@ impl IssueTracker {
             creating: false,
             list_focus: cx.focus_handle(),
             save_task: None,
+            catalogue,
+            light_select,
+            dark_select,
             _subscriptions: subscriptions,
         };
         this.load_selected_into_inputs(window, cx);
@@ -373,6 +450,42 @@ impl IssueTracker {
         self.new_issue_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.list_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    // ---- appearance ---------------------------------------------------------
+
+    /// Persists a theme choice and applies it.
+    ///
+    /// Writes through to the store *before* touching the live theme, mirroring
+    /// the ordering discipline in ADR-0002 — if the write fails the app keeps
+    /// the appearance the database can actually reproduce on next launch.
+    pub(super) fn choose_theme(
+        &mut self,
+        mode: ThemeMode,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(choice) = self.catalogue.find(mode, name) else {
+            eprintln!("theme {name:?} is not in the catalogue");
+            return;
+        };
+        let config = choice.config.clone();
+
+        let key = match mode {
+            ThemeMode::Light => settings_keys::THEME_LIGHT,
+            ThemeMode::Dark => settings_keys::THEME_DARK,
+        };
+        if let Err(err) = self.store.set_setting(key, name) {
+            eprintln!("failed to save {key}: {err:#}");
+            return;
+        }
+
+        match mode {
+            ThemeMode::Light => super::theme::apply_themes(Some(config), None, window, cx),
+            ThemeMode::Dark => super::theme::apply_themes(None, Some(config), window, cx),
+        }
         cx.notify();
     }
 
