@@ -10,7 +10,7 @@ use super::tracker::IssueTracker;
 use crate::domain::View;
 
 impl IssueTracker {
-    pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let active = self.active_view();
         let counts: Vec<(View, usize)> = View::ALL
             .into_iter()

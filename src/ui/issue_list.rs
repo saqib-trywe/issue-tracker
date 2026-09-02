@@ -3,7 +3,8 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::Input;
-use gpui_component::{ActiveTheme, Sizable};
+use gpui_component::sidebar::SidebarToggleButton;
+use gpui_component::{ActiveTheme, Side, Sizable};
 
 use super::tracker::{IssueTracker, LIST_CONTEXT};
 use crate::domain::{Issue, Priority};
@@ -63,6 +64,22 @@ impl IssueTracker {
             .p_2()
             .border_b_1()
             .border_color(cx.theme().border)
+            // Lives here rather than in the sidebar so it stays reachable —
+            // and in the same place — whether the sidebar is shown or hidden.
+            .child(
+                SidebarToggleButton::new()
+                    .side(Side::Left)
+                    .collapsed(self.sidebar_hidden())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+            )
+            // With the sidebar hidden this is the only thing naming the
+            // active View.
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(self.active_view().label()),
+            )
             .child(div().flex_1().child(Input::new(&self.filter_input).small()))
             .child(
                 div()

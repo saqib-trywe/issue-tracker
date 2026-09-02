@@ -31,6 +31,7 @@ actions!(
         DeleteIssue,
         FocusFilter,
         CancelEditing,
+        ToggleSidebar,
     ]
 );
 
@@ -58,6 +59,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("x", DeleteIssue, Some(LIST_CONTEXT)),
         KeyBinding::new("/", FocusFilter, Some(LIST_CONTEXT)),
         KeyBinding::new("escape", CancelEditing, None),
+        // Deliberately unscoped: unlike j/k/c this has to work while a text
+        // input has focus, and a cmd chord cannot collide with typing.
+        KeyBinding::new("cmd-b", ToggleSidebar, None),
     ]);
 }
 
@@ -76,6 +80,9 @@ pub struct IssueTracker {
     pub(super) new_issue_input: Entity<InputState>,
     /// Whether the inline "new issue" row is showing.
     pub(super) creating: bool,
+    /// Hiding the sidebar also hides the View list and the theme pickers;
+    /// `cmd-b` brings them back.
+    pub(super) sidebar_hidden: bool,
 
     pub(super) list_focus: FocusHandle,
     /// Replaced on every keystroke; dropping the previous task cancels it,
@@ -112,6 +119,10 @@ impl IssueTracker {
         let catalogue = ThemeCatalogue::load();
         let stored_light = read_setting(&store, settings_keys::THEME_LIGHT);
         let stored_dark = read_setting(&store, settings_keys::THEME_DARK);
+        // Anything other than "true" — absent or malformed included — means
+        // visible, which is the safer state to land on.
+        let sidebar_hidden = read_setting(&store, settings_keys::SIDEBAR_HIDDEN)
+            .is_some_and(|value| value == "true");
 
         let light_config = stored_light
             .as_deref()
@@ -214,6 +225,7 @@ impl IssueTracker {
             filter_input,
             new_issue_input,
             creating: false,
+            sidebar_hidden,
             list_focus: cx.focus_handle(),
             save_task: None,
             catalogue,
@@ -453,6 +465,32 @@ impl IssueTracker {
         cx.notify();
     }
 
+    // ---- sidebar ------------------------------------------------------------
+
+    /// Shows or hides the sidebar.
+    ///
+    /// Unlike [`Self::choose_theme`], a failed write does not abort the
+    /// change: this is view state, and the user's immediate intent should not
+    /// be held hostage by a settings write. The worst case is that the next
+    /// launch disagrees, which is recoverable with another `cmd-b`.
+    pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        cx.notify();
+
+        let value = if self.sidebar_hidden { "true" } else { "false" };
+        if let Err(err) = self.store.set_setting(settings_keys::SIDEBAR_HIDDEN, value) {
+            eprintln!("failed to save sidebar visibility: {err:#}");
+        }
+    }
+
+    pub(super) fn sidebar_hidden(&self) -> bool {
+        self.sidebar_hidden
+    }
+
+    fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_sidebar(cx);
+    }
+
     // ---- appearance ---------------------------------------------------------
 
     /// Persists a theme choice and applies it.
@@ -567,6 +605,14 @@ impl IssueTracker {
 
 impl Render for IssueTracker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // `Option` is an iterator of zero or one, so this drops the sidebar
+        // out of the tree entirely rather than rendering it at zero width.
+        let sidebar = if self.sidebar_hidden {
+            None
+        } else {
+            Some(self.render_sidebar(cx))
+        };
+
         div()
             .key_context("IssueTracker")
             .on_action(cx.listener(Self::on_select_next))
@@ -576,10 +622,11 @@ impl Render for IssueTracker {
             .on_action(cx.listener(Self::on_delete_issue))
             .on_action(cx.listener(Self::on_focus_filter))
             .on_action(cx.listener(Self::on_cancel_editing))
+            .on_action(cx.listener(Self::on_toggle_sidebar))
             .size_full()
             .flex()
             .flex_row()
-            .child(self.render_sidebar(cx))
+            .children(sidebar)
             .child(self.render_issue_list(window, cx))
             .child(self.render_issue_detail(window, cx))
     }

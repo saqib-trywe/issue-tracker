@@ -138,10 +138,13 @@ impl Store {
     }
 }
 
-/// Preference keys. Values are theme display names as shown in the picker.
+/// Preference keys.
 pub mod settings_keys {
+    /// Theme display names, as shown in the picker.
     pub const THEME_LIGHT: &str = "theme.light";
     pub const THEME_DARK: &str = "theme.dark";
+    /// `"true"` / `"false"`. Absent means visible.
+    pub const SIDEBAR_HIDDEN: &str = "sidebar.hidden";
 }
 
 /// The database file location: `$ISSUE_TRACKER_DB` when set, otherwise the
@@ -331,6 +334,32 @@ mod tests {
         assert_eq!(
             store.get_setting("theme.dark").unwrap(),
             Some("Solarized Dark".to_string())
+        );
+    }
+
+    #[test]
+    fn sidebar_hidden_round_trips() {
+        let store = store();
+        assert_eq!(
+            store.get_setting(settings_keys::SIDEBAR_HIDDEN).unwrap(),
+            None,
+            "absent means visible"
+        );
+
+        store
+            .set_setting(settings_keys::SIDEBAR_HIDDEN, "true")
+            .unwrap();
+        assert_eq!(
+            store.get_setting(settings_keys::SIDEBAR_HIDDEN).unwrap(),
+            Some("true".to_string())
+        );
+
+        store
+            .set_setting(settings_keys::SIDEBAR_HIDDEN, "false")
+            .unwrap();
+        assert_eq!(
+            store.get_setting(settings_keys::SIDEBAR_HIDDEN).unwrap(),
+            Some("false".to_string())
         );
     }
 
