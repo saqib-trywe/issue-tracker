@@ -187,6 +187,37 @@ impl View {
     }
 }
 
+/// The persisted form of a View.
+///
+/// Deliberately distinct from [`View::label`], which is human-facing text —
+/// `All` persists as `"All"` but displays as `"All Issues"`. Keeping them
+/// separate means the display text can be reworded without invalidating
+/// anything already stored.
+impl fmt::Display for View {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            View::All => f.write_str("All"),
+            View::WithStatus(status) => f.write_str(status.label()),
+        }
+    }
+}
+
+impl FromStr for View {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "All" {
+            return Ok(View::All);
+        }
+        s.parse::<Status>()
+            .map(View::WithStatus)
+            .map_err(|_| ParseError {
+                kind: "view",
+                value: s.to_owned(),
+            })
+    }
+}
+
 /// Orders Issues for display: highest priority first, then most recently
 /// updated. Ties break on `id` so the order is never ambiguous.
 pub fn sort_for_display(issues: &mut [Issue]) {
@@ -261,6 +292,27 @@ mod tests {
 
         assert!(view.contains(&blocked));
         assert!(!view.contains(&todo));
+    }
+
+    #[test]
+    fn view_round_trips_through_text() {
+        for view in View::ALL {
+            assert_eq!(view.to_string().parse::<View>().unwrap(), view);
+        }
+    }
+
+    #[test]
+    fn view_persistence_is_independent_of_display_text() {
+        // "All Issues" is what the user sees; "All" is what gets stored.
+        // Rewording the label must not invalidate stored values.
+        assert_eq!(View::All.to_string(), "All");
+        assert_eq!(View::All.label(), "All Issues");
+    }
+
+    #[test]
+    fn unknown_view_is_rejected() {
+        assert!("Archived".parse::<View>().is_err());
+        assert!("All Issues".parse::<View>().is_err());
     }
 
     #[test]

@@ -145,6 +145,12 @@ pub mod settings_keys {
     pub const THEME_DARK: &str = "theme.dark";
     /// `"true"` / `"false"`. Absent means visible.
     pub const SIDEBAR_HIDDEN: &str = "sidebar.hidden";
+
+    /// Working state, restored when the window is reopened. Unlike the keys
+    /// above these are not preferences — they are where you happened to be.
+    pub const UI_VIEW: &str = "ui.view";
+    pub const UI_SELECTED: &str = "ui.selected";
+    pub const UI_FILTER: &str = "ui.filter";
 }
 
 /// The database file location: `$ISSUE_TRACKER_DB` when set, otherwise the

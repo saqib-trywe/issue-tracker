@@ -5,6 +5,7 @@
 
 mod issue_detail;
 mod issue_list;
+pub mod menus;
 mod sidebar;
 mod theme;
 mod theme_catalogue;

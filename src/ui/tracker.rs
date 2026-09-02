@@ -32,8 +32,22 @@ actions!(
         FocusFilter,
         CancelEditing,
         ToggleSidebar,
+        Quit,
+        Hide,
+        HideOthers,
+        Minimize,
+        Zoom,
+        CloseWindow,
     ]
 );
+
+/// Switches to a View. Carries its payload so one action serves all six menu
+/// items; `no_json` keeps `schemars` out of the dependency tree.
+#[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
+#[action(namespace = issue_tracker, no_json)]
+pub struct ShowView {
+    pub view: View,
+}
 
 /// Reads a preference, treating a read failure as "unset" — a broken settings
 /// row should cost you a theme, not the app.
@@ -59,9 +73,14 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("x", DeleteIssue, Some(LIST_CONTEXT)),
         KeyBinding::new("/", FocusFilter, Some(LIST_CONTEXT)),
         KeyBinding::new("escape", CancelEditing, None),
-        // Deliberately unscoped: unlike j/k/c this has to work while a text
-        // input has focus, and a cmd chord cannot collide with typing.
+        // Deliberately unscoped: unlike j/k/c these have to work while a text
+        // input has focus, and cmd chords cannot collide with typing.
         KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new("cmd-n", CreateIssue, None),
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-w", CloseWindow, None),
+        KeyBinding::new("cmd-m", Minimize, None),
+        KeyBinding::new("cmd-h", Hide, None),
     ]);
 }
 
@@ -88,6 +107,9 @@ pub struct IssueTracker {
     /// Replaced on every keystroke; dropping the previous task cancels it,
     /// which is what makes the save debounced.
     save_task: Option<Task<()>>,
+    /// Same debounce trick for View/selection/filter, which change far too
+    /// often to write through on every keypress.
+    ui_state_task: Option<Task<()>>,
 
     /// Every embedded theme, split by mode. Held so a selection can be
     /// resolved back to the config it applies.
@@ -106,7 +128,8 @@ impl IssueTracker {
             Vec::new()
         });
         sort_for_display(&mut issues);
-        let selected = issues.first().map(|issue| issue.id);
+        // Resolved properly once the restored View and filter are known.
+        let selected: Option<IssueId> = None;
 
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue title"));
         let body_input = cx.new(|cx| {
@@ -123,6 +146,15 @@ impl IssueTracker {
         // visible, which is the safer state to land on.
         let sidebar_hidden = read_setting(&store, settings_keys::SIDEBAR_HIDDEN)
             .is_some_and(|value| value == "true");
+
+        // Working state from the last session. Anything unparseable is
+        // treated as absent rather than fatal.
+        let view = read_setting(&store, settings_keys::UI_VIEW)
+            .and_then(|value| value.parse::<View>().ok())
+            .unwrap_or_default();
+        let filter = read_setting(&store, settings_keys::UI_FILTER).unwrap_or_default();
+        let restored_selection = read_setting(&store, settings_keys::UI_SELECTED)
+            .and_then(|value| value.parse::<IssueId>().ok());
 
         let light_config = stored_light
             .as_deref()
@@ -175,6 +207,7 @@ impl IssueTracker {
                     if matches!(event, InputEvent::Change) {
                         this.filter = input.read(cx).value().to_string();
                         this.ensure_selection_visible();
+                        this.schedule_ui_state_save(cx);
                         cx.notify();
                     }
                 },
@@ -212,14 +245,24 @@ impl IssueTracker {
             // Chrome rather than issues, but this is the only object that
             // lives as long as the window, so it holds the subscription.
             super::theme::observe_system_appearance(window),
+            // Closing the window drops this entity along with any pending
+            // debounced write, so flush on the way out.
+            cx.on_release(|this, cx| {
+                if this.save_task.take().is_some()
+                    && let Some(id) = this.selected
+                {
+                    this.write_edits(id, cx);
+                }
+                this.write_ui_state();
+            }),
         ];
 
         let mut this = Self {
             store,
             issues,
-            view: View::All,
+            view,
             selected,
-            filter: String::new(),
+            filter,
             title_input,
             body_input,
             filter_input,
@@ -228,11 +271,29 @@ impl IssueTracker {
             sidebar_hidden,
             list_focus: cx.focus_handle(),
             save_task: None,
+            ui_state_task: None,
             catalogue,
             light_select,
             dark_select,
             _subscriptions: subscriptions,
         };
+        // Prefer the issue we were last on, but only if it still exists and
+        // is visible under the restored View and filter — it may have been
+        // deleted, or filtered out, since the window closed.
+        let visible: Vec<IssueId> = this.visible_issues().iter().map(|i| i.id).collect();
+        this.selected = restored_selection
+            .filter(|id| visible.contains(id))
+            .or_else(|| visible.first().copied());
+
+        // The filter came back as a plain String; the input showing it has to
+        // be told separately. `set_value` suppresses change events, so this
+        // does not re-trigger the filter subscription.
+        if !this.filter.is_empty() {
+            let filter = this.filter.clone();
+            this.filter_input
+                .update(cx, |input, cx| input.set_value(filter, window, cx));
+        }
+
         this.load_selected_into_inputs(window, cx);
         // Without this the window opens with nothing focused, so the list
         // bindings (j/k/c/e/x) are dead until something is clicked.
@@ -279,6 +340,10 @@ impl IssueTracker {
         self.view = view;
         self.ensure_selection_visible();
         self.load_selected_into_inputs(window, cx);
+        self.schedule_ui_state_save(cx);
+        // The View menu carries a checkmark, so the tree has to be rebuilt
+        // for it to follow the active View.
+        super::menus::rebuild(view, cx);
         cx.notify();
     }
 
@@ -296,6 +361,7 @@ impl IssueTracker {
         self.flush_pending_save(cx);
         self.selected = Some(id);
         self.load_selected_into_inputs(window, cx);
+        self.schedule_ui_state_save(cx);
         cx.notify();
     }
 
@@ -354,11 +420,16 @@ impl IssueTracker {
             && let Some(id) = self.selected
         {
             self.write_edits(id, cx);
+            cx.notify();
         }
     }
 
     /// Writes the inputs through to SQLite, then updates the projection.
-    fn write_edits(&mut self, id: IssueId, cx: &mut Context<Self>) {
+    ///
+    /// Takes `&mut App` rather than `Context<Self>` so it can also run from
+    /// `on_release`, where the entity is being torn down and no `Context`
+    /// exists. Callers that are still live should `cx.notify()` afterwards.
+    fn write_edits(&mut self, id: IssueId, cx: &mut App) {
         self.save_task = None;
         let title = self.title_input.read(cx).value().to_string();
         let body = self.body_input.read(cx).value().to_string();
@@ -381,7 +452,6 @@ impl IssueTracker {
             }
             Err(err) => eprintln!("failed to save issue #{id}: {err:#}"),
         }
-        cx.notify();
     }
 
     pub(super) fn set_status(
@@ -465,6 +535,50 @@ impl IssueTracker {
         cx.notify();
     }
 
+    // ---- working state ------------------------------------------------------
+
+    /// Queues a write of View, selection and filter.
+    ///
+    /// Debounced because these change on every `j`/`k` and every character
+    /// typed into the filter, unlike the preferences which change rarely.
+    fn schedule_ui_state_save(&mut self, cx: &mut Context<Self>) {
+        self.ui_state_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DEBOUNCE).await;
+            this.update(cx, |this, _| this.write_ui_state()).ok();
+        }));
+    }
+
+    /// Writes working state immediately. Failures are logged, never fatal —
+    /// losing your place is not worth interrupting anyone over.
+    fn write_ui_state(&mut self) {
+        self.ui_state_task = None;
+
+        let selected = self.selected.map(|id| id.to_string()).unwrap_or_default();
+        let values = [
+            (settings_keys::UI_VIEW, self.view.to_string()),
+            (settings_keys::UI_SELECTED, selected),
+            (settings_keys::UI_FILTER, self.filter.clone()),
+        ];
+
+        for (key, value) in values {
+            if let Err(err) = self.store.set_setting(key, &value) {
+                eprintln!("failed to save {key}: {err:#}");
+            }
+        }
+    }
+
+    /// Flushes everything still sitting behind a debounce.
+    ///
+    /// Without this, quitting or closing the window within the debounce
+    /// window silently discards the last edit. That path only became
+    /// reachable once `cmd-q` started working.
+    pub(super) fn flush_pending_writes(&mut self, cx: &mut Context<Self>) {
+        self.flush_pending_save(cx);
+        if self.ui_state_task.is_some() {
+            self.write_ui_state();
+        }
+    }
+
     // ---- sidebar ------------------------------------------------------------
 
     /// Shows or hides the sidebar.
@@ -489,6 +603,41 @@ impl IssueTracker {
 
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
         self.toggle_sidebar(cx);
+    }
+
+    // ---- application ---------------------------------------------------------
+
+    fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        // Flush before asking the app to go away, or the last 400ms of
+        // editing is lost.
+        self.flush_pending_writes(cx);
+        cx.quit();
+    }
+
+    fn on_hide(&mut self, _: &Hide, _: &mut Window, cx: &mut Context<Self>) {
+        cx.hide();
+    }
+
+    fn on_hide_others(&mut self, _: &HideOthers, _: &mut Window, cx: &mut Context<Self>) {
+        cx.hide_other_apps();
+    }
+
+    fn on_minimize(&mut self, _: &Minimize, window: &mut Window, _: &mut Context<Self>) {
+        window.minimize_window();
+    }
+
+    fn on_zoom(&mut self, _: &Zoom, window: &mut Window, _: &mut Context<Self>) {
+        window.zoom_window();
+    }
+
+    fn on_close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
+        // The app stays alive with no window, so this has to flush too.
+        self.flush_pending_writes(cx);
+        window.remove_window();
+    }
+
+    fn on_show_view(&mut self, action: &ShowView, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_view(action.view, window, cx);
     }
 
     // ---- appearance ---------------------------------------------------------
@@ -623,6 +772,13 @@ impl Render for IssueTracker {
             .on_action(cx.listener(Self::on_focus_filter))
             .on_action(cx.listener(Self::on_cancel_editing))
             .on_action(cx.listener(Self::on_toggle_sidebar))
+            .on_action(cx.listener(Self::on_quit))
+            .on_action(cx.listener(Self::on_hide))
+            .on_action(cx.listener(Self::on_hide_others))
+            .on_action(cx.listener(Self::on_minimize))
+            .on_action(cx.listener(Self::on_zoom))
+            .on_action(cx.listener(Self::on_close_window))
+            .on_action(cx.listener(Self::on_show_view))
             .size_full()
             .flex()
             .flex_row()
