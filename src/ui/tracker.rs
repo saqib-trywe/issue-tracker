@@ -1,17 +1,44 @@
 //! Root view: owns the Store, the in-memory projection, and all selection
 //! state. The three columns are rendered by sibling modules.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use gpui::*;
 use gpui_component::input::{InputEvent, InputState, TextareaState};
 
 use gpui_component::ThemeMode;
+use gpui_component::combobox::{ComboboxEvent, ComboboxState};
+use gpui_component::searchable_list::SearchableVec;
 use gpui_component::select::{SelectEvent, SelectState};
 
 use super::theme_catalogue::{ThemeCatalogue, ThemeListDelegate};
-use crate::domain::{Issue, IssueId, Priority, Status, View, sort_for_display};
+use crate::domain::{
+    Issue, IssueId, Priority, Status, Tag, View, normalise_tags, sort_for_display,
+};
 use crate::store::{Store, settings_keys};
+
+/// The Tag editor in the detail pane. Tags are plain names, so the delegate is
+/// the library's own `SearchableVec` and no custom one is needed.
+pub(super) type TagCombobox = ComboboxState<SearchableVec<String>>;
+
+/// Every Tag carried by some Issue. This *is* the Tag list — derived Tags have
+/// no registry to consult.
+fn collect_tags(issues: &[Issue]) -> BTreeSet<Tag> {
+    issues
+        .iter()
+        .flat_map(|issue| issue.tags.iter().cloned())
+        .collect()
+}
+
+fn tag_items(in_use: &BTreeSet<Tag>) -> SearchableVec<String> {
+    SearchableVec::new(
+        in_use
+            .iter()
+            .map(|tag| tag.as_str().to_owned())
+            .collect::<Vec<_>>(),
+    )
+}
 
 /// How long editing pauses before an auto-save fires.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
@@ -30,6 +57,7 @@ actions!(
         EditIssue,
         DeleteIssue,
         FocusFilter,
+        FocusTags,
         CancelEditing,
         ToggleSidebar,
         Quit,
@@ -72,6 +100,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("e", EditIssue, Some(LIST_CONTEXT)),
         KeyBinding::new("x", DeleteIssue, Some(LIST_CONTEXT)),
         KeyBinding::new("/", FocusFilter, Some(LIST_CONTEXT)),
+        KeyBinding::new("t", FocusTags, Some(LIST_CONTEXT)),
         KeyBinding::new("escape", CancelEditing, None),
         // Deliberately unscoped: unlike j/k/c these have to work while a text
         // input has focus, and cmd chords cannot collide with typing.
@@ -92,6 +121,10 @@ pub struct IssueTracker {
     selected: Option<IssueId>,
     /// Substring filter over titles, driven by the list header input.
     filter: String,
+    /// Narrows the list to one Tag *within* the active View. Deliberately not
+    /// a `View` variant: a View is predefined, a Tag filter is whatever the
+    /// user invented. See docs/adr/0004.
+    tag_filter: Option<Tag>,
 
     pub(super) title_input: Entity<InputState>,
     pub(super) body_input: Entity<TextareaState>,
@@ -114,6 +147,7 @@ pub struct IssueTracker {
     /// Every embedded theme, split by mode. Held so a selection can be
     /// resolved back to the config it applies.
     catalogue: ThemeCatalogue,
+    pub(super) tag_select: Entity<TagCombobox>,
     pub(super) light_select: Entity<SelectState<ThemeListDelegate>>,
     pub(super) dark_select: Entity<SelectState<ThemeListDelegate>>,
 
@@ -153,6 +187,13 @@ impl IssueTracker {
             .and_then(|value| value.parse::<View>().ok())
             .unwrap_or_default();
         let filter = read_setting(&store, settings_keys::UI_FILTER).unwrap_or_default();
+        // A stored Tag that nothing carries any more is dropped rather than
+        // restored: it would filter the list down to nothing, and the sidebar
+        // row you would clear it from no longer exists.
+        let in_use = collect_tags(&issues);
+        let tag_filter = read_setting(&store, settings_keys::UI_TAG)
+            .and_then(|value| value.parse::<Tag>().ok())
+            .filter(|tag| in_use.contains(tag));
         let restored_selection = read_setting(&store, settings_keys::UI_SELECTED)
             .and_then(|value| value.parse::<IssueId>().ok());
 
@@ -180,6 +221,12 @@ impl IssueTracker {
 
         let light_select = cx.new(|cx| SelectState::new(light_delegate, light_index, window, cx));
         let dark_select = cx.new(|cx| SelectState::new(dark_delegate, dark_index, window, cx));
+
+        let tag_select = cx.new(|cx| {
+            ComboboxState::new(tag_items(&in_use), Vec::new(), window, cx)
+                .multiple(true)
+                .searchable(true)
+        });
 
         let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter titles…"));
         let new_issue_input =
@@ -220,6 +267,17 @@ impl IssueTracker {
                         let title = input.read(cx).value().to_string();
                         this.commit_new_issue(title, window, cx);
                     }
+                },
+            ),
+            // Fires on every toggle in the dropdown, add or remove.
+            cx.subscribe_in(
+                &tag_select,
+                window,
+                |this, _, event: &ComboboxEvent<SearchableVec<String>>, _, cx| {
+                    let ComboboxEvent::Change(values) = event else {
+                        return;
+                    };
+                    this.apply_tag_selection(values.clone(), cx);
                 },
             ),
             cx.subscribe_in(
@@ -263,6 +321,7 @@ impl IssueTracker {
             view,
             selected,
             filter,
+            tag_filter,
             title_input,
             body_input,
             filter_input,
@@ -273,6 +332,7 @@ impl IssueTracker {
             save_task: None,
             ui_state_task: None,
             catalogue,
+            tag_select,
             light_select,
             dark_select,
             _subscriptions: subscriptions,
@@ -310,7 +370,30 @@ impl IssueTracker {
             .iter()
             .filter(|issue| self.view.contains(issue))
             .filter(|issue| needle.is_empty() || issue.title.to_lowercase().contains(&needle))
+            .filter(|issue| {
+                self.tag_filter
+                    .as_ref()
+                    .is_none_or(|tag| issue.tags.contains(tag))
+            })
             .collect()
+    }
+
+    /// Every Tag carried by some Issue, sorted, first-spelling-wins.
+    pub(super) fn tags_in_use(&self) -> BTreeSet<Tag> {
+        collect_tags(&self.issues)
+    }
+
+    pub(super) fn active_tag(&self) -> Option<&Tag> {
+        self.tag_filter.as_ref()
+    }
+
+    /// How many Issues carry a Tag, ignoring the View and the filter — the
+    /// Tag equivalent of [`Self::count_for`].
+    pub(super) fn count_for_tag(&self, tag: &Tag) -> usize {
+        self.issues
+            .iter()
+            .filter(|issue| issue.tags.contains(tag))
+            .count()
     }
 
     pub(super) fn active_view(&self) -> View {
@@ -365,6 +448,37 @@ impl IssueTracker {
         cx.notify();
     }
 
+    /// Selects a Tag filter, or clears it when the active Tag is picked again.
+    pub(super) fn toggle_tag_filter(
+        &mut self,
+        tag: Tag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tag_filter = if self.tag_filter.as_ref() == Some(&tag) {
+            None
+        } else {
+            Some(tag)
+        };
+        self.ensure_selection_visible();
+        self.load_selected_into_inputs(window, cx);
+        self.schedule_ui_state_save(cx);
+        cx.notify();
+    }
+
+    /// Drops a Tag filter whose Tag no longer exists.
+    ///
+    /// A derived Tag vanishes the moment the last Issue lets go of it. A
+    /// filter still pointing at one would show an empty list with no way back,
+    /// because the sidebar row you would click to clear it is gone too.
+    fn prune_tag_filter(&mut self) {
+        if let Some(tag) = &self.tag_filter
+            && !self.issues.iter().any(|issue| issue.tags.contains(tag))
+        {
+            self.tag_filter = None;
+        }
+    }
+
     /// Keeps the selection inside the visible set after a View or filter change.
     fn ensure_selection_visible(&mut self) {
         let visible: Vec<IssueId> = self.visible_issues().iter().map(|i| i.id).collect();
@@ -402,6 +516,7 @@ impl IssueTracker {
             .update(cx, |input, cx| input.set_value(title, window, cx));
         self.body_input
             .update(cx, |input, cx| input.set_value(body, window, cx));
+        self.sync_tag_select(window, cx);
     }
 
     /// Restarts the debounce window. The previous task is dropped, cancelling
@@ -472,6 +587,95 @@ impl IssueTracker {
         self.mutate_selected(cx, |issue| issue.priority = priority);
     }
 
+    /// Writes a Tag set onto the selected Issue.
+    ///
+    /// Routed through [`Self::mutate_selected`], so tagging stamps
+    /// `updated_at` and re-sorts exactly as a Status or Priority change does:
+    /// tagging is an edit, not a free annotation.
+    fn set_tags(&mut self, tags: Vec<Tag>, cx: &mut Context<Self>) {
+        let in_use = self.tags_in_use();
+        let tags = normalise_tags(tags, &in_use);
+        // Tag equality is case-insensitive, so this also catches a `bug` that
+        // folded into an existing `Bug` and would otherwise bump `updated_at`
+        // for no visible change.
+        if self
+            .selected_issue()
+            .is_some_and(|issue| issue.tags == tags)
+        {
+            return;
+        }
+        self.mutate_selected(cx, |issue| issue.tags = tags);
+    }
+
+    /// Applies whatever the Combobox now reports as selected.
+    fn apply_tag_selection(&mut self, values: Vec<String>, cx: &mut Context<Self>) {
+        let tags = values
+            .iter()
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        self.set_tags(tags, cx);
+    }
+
+    /// Adds the Tag currently typed into the Combobox's search box.
+    ///
+    /// The library's own recipe for this only appends the typed name to the
+    /// dropdown list, leaving you to click the thing you just typed. Putting
+    /// it straight on the Issue saves that second click.
+    pub(super) fn create_tag_from_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.tag_select.read(cx).query(cx).to_string();
+        let Ok(tag) = query.parse::<Tag>() else {
+            return;
+        };
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
+        let mut tags = issue.tags.clone();
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+        self.set_tags(tags, cx);
+        self.sync_tag_select(window, cx);
+    }
+
+    /// Takes one Tag off the selected Issue, from its chip's remove button.
+    pub(super) fn remove_tag(&mut self, tag: Tag, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(issue) = self.selected_issue() else {
+            return;
+        };
+        let tags = issue
+            .tags
+            .iter()
+            .filter(|candidate| **candidate != tag)
+            .cloned()
+            .collect();
+        self.set_tags(tags, cx);
+        self.sync_tag_select(window, cx);
+    }
+
+    /// Points the Combobox at the current Tag vocabulary and the selected
+    /// Issue's Tags.
+    ///
+    /// Called when the selected Issue changes — never on every write.
+    /// `set_selected_values` clears the search query as a side effect, which
+    /// would yank the text out from under someone mid-type.
+    fn sync_tag_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = tag_items(&self.tags_in_use());
+        let selected: Vec<String> = self
+            .selected_issue()
+            .map(|issue| {
+                issue
+                    .tags
+                    .iter()
+                    .map(|tag| tag.as_str().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.tag_select.update(cx, |state, cx| {
+            state.set_items(items, window, cx);
+            state.set_selected_values(&selected, window, cx);
+        });
+    }
+
     /// Applies a change to the selected Issue and writes it through.
     fn mutate_selected(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Issue)) {
         let Some(id) = self.selected else { return };
@@ -489,7 +693,9 @@ impl IssueTracker {
             Err(err) => eprintln!("failed to save issue #{id}: {err:#}"),
         }
         sort_for_display(&mut self.issues);
-        // A status change can move the Issue out of the active View.
+        // A status change can move the Issue out of the active View, and
+        // dropping the last use of a Tag can empty the Tag filter.
+        self.prune_tag_filter();
         self.ensure_selection_visible();
         cx.notify();
     }
@@ -554,10 +760,16 @@ impl IssueTracker {
         self.ui_state_task = None;
 
         let selected = self.selected.map(|id| id.to_string()).unwrap_or_default();
+        let tag = self
+            .tag_filter
+            .as_ref()
+            .map(|tag| tag.as_str().to_owned())
+            .unwrap_or_default();
         let values = [
             (settings_keys::UI_VIEW, self.view.to_string()),
             (settings_keys::UI_SELECTED, selected),
             (settings_keys::UI_FILTER, self.filter.clone()),
+            (settings_keys::UI_TAG, tag),
         ];
 
         for (key, value) in values {
@@ -693,6 +905,7 @@ impl IssueTracker {
             return;
         }
         self.issues.retain(|issue| issue.id != id);
+        self.prune_tag_filter();
         if self.selected == Some(id) {
             self.selected = None;
             self.ensure_selection_visible();
@@ -735,6 +948,13 @@ impl IssueTracker {
             .update(cx, |input, cx| input.focus(window, cx));
     }
 
+    fn on_focus_tags(&mut self, _: &FocusTags, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_some() {
+            self.tag_select
+                .update(cx, |state, cx| state.focus(window, cx));
+        }
+    }
+
     /// Escape always returns to the list, from wherever focus currently is.
     fn on_cancel_editing(
         &mut self,
@@ -770,6 +990,7 @@ impl Render for IssueTracker {
             .on_action(cx.listener(Self::on_edit_issue))
             .on_action(cx.listener(Self::on_delete_issue))
             .on_action(cx.listener(Self::on_focus_filter))
+            .on_action(cx.listener(Self::on_focus_tags))
             .on_action(cx.listener(Self::on_cancel_editing))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_quit))

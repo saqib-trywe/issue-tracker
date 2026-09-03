@@ -28,6 +28,17 @@ pub fn migrations() -> Migrations<'static> {
              value TEXT NOT NULL
          );",
         ),
+        // Tags are derived from use, so there is no `tag` table: a Tag exists
+        // exactly as long as some Issue carries it. See docs/adr/0004.
+        // `foreign_keys` is ON (see `Store::prepare`), so erasing an Issue
+        // takes its Tags with it.
+        M::up(
+            "CREATE TABLE issue_tag (
+             issue_id INTEGER NOT NULL REFERENCES issue(id) ON DELETE CASCADE,
+             name     TEXT NOT NULL,
+             PRIMARY KEY (issue_id, name)
+         ) WITHOUT ROWID;",
+        ),
     ])
 }
 

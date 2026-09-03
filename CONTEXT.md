@@ -32,6 +32,19 @@ A named, predefined slice of all Issues, shown in the sidebar. Currently a
 Status filter. Not user-created.
 _Avoid_: Filter, Query, Smart list, Folder
 
+**Tag**:
+A name the user invents and attaches to an Issue. A Tag exists exactly as long
+as some Issue carries it: there is no list of Tags apart from the Issues
+wearing them, and the last Issue to let go of one takes it with it.
+Case-insensitive, so `Bug` and `bug` are one Tag. Flat — `ui/theme` is a name
+that happens to contain a slash, not a child of `ui`.
+_Avoid_: Label, Category, Topic, Keyword
+
+**Tag filter**:
+Narrowing the list to a single Tag. Distinct from a View: a View is predefined
+and a Tag filter is whatever the user invented, and the two compose — a Tag
+filter narrows *within* whichever View is active.
+
 ## Cancelling vs deleting
 
 These are different acts and both exist:
@@ -48,4 +61,6 @@ These are different acts and both exist:
 - **Project**: no grouping concept above Issue.
 - **Comment**: a single user talking to themselves. The Issue body serves
   instead.
-- **Label**: not modelled yet.
+- **Renaming a Tag**, or removing one from every Issue at once. A misspelled
+  Tag is corrected by retagging the Issues that carry it. There is no registry
+  to rename it in, because a Tag is not a record.

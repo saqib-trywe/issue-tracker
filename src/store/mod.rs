@@ -7,13 +7,14 @@
 
 mod migrations;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Row};
 
-use crate::domain::{Issue, IssueId, Priority, Status};
+use crate::domain::{Issue, IssueId, Priority, Status, Tag};
 
 /// Points the store at a scratch database during development so experiments
 /// never touch real data.
@@ -56,15 +57,43 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// Loads every Issue. The caller owns the result and renders from it.
+    /// Loads every Issue, Tags included. The caller owns the result and
+    /// renders from it.
     pub fn load_all(&self) -> Result<Vec<Issue>> {
         let mut statement = self
             .conn
             .prepare(&format!("SELECT {SELECT_COLUMNS} FROM issue"))?;
-        let issues = statement
+        let mut issues = statement
             .query_map([], read_issue)?
             .collect::<Result<Vec<_>, _>>()?;
+
+        let mut tags = self.load_tags()?;
+        for issue in &mut issues {
+            issue.tags = tags.remove(&issue.id).unwrap_or_default();
+        }
         Ok(issues)
+    }
+
+    /// Every Issue's Tags in one pass, keyed by Issue.
+    ///
+    /// One query rather than one per Issue, so loading stays two statements
+    /// however many Issues there are.
+    fn load_tags(&self) -> Result<HashMap<IssueId, Vec<Tag>>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT issue_id, name FROM issue_tag ORDER BY name COLLATE NOCASE")?;
+        let rows = statement.query_map([], |row| {
+            let id: IssueId = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok((id, parse_column::<Tag>(&name, 1)?))
+        })?;
+
+        let mut tags: HashMap<IssueId, Vec<Tag>> = HashMap::new();
+        for row in rows {
+            let (id, tag) = row?;
+            tags.entry(id).or_default().push(tag);
+        }
+        Ok(tags)
     }
 
     /// Creates a title-only Issue at the default Status and Priority.
@@ -89,9 +118,16 @@ impl Store {
 
     /// Writes every mutable field and stamps `updated_at`, returning the new
     /// timestamp so the caller can keep its in-memory copy in step.
+    ///
+    /// Transactional because Tags live in a second table: the row and its Tags
+    /// have to move together, or a crash between the two leaves an Issue
+    /// wearing the Tags of its previous revision. `unchecked_transaction`
+    /// rather than `transaction` so this keeps its `&self` signature — the
+    /// callers hold an immutable borrow of the projection while writing.
     pub fn update(&self, issue: &Issue) -> Result<DateTime<Utc>> {
         let now = Utc::now();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE issue
                 SET title = ?2, body = ?3, status = ?4, priority = ?5, updated_at = ?6
               WHERE id = ?1",
@@ -104,6 +140,22 @@ impl Store {
                 format_timestamp(now),
             ],
         )?;
+
+        // Replace wholesale rather than diffing: the Tag set is a handful of
+        // rows, and a diff is more code and more ways to be wrong.
+        tx.execute(
+            "DELETE FROM issue_tag WHERE issue_id = ?1",
+            rusqlite::params![issue.id],
+        )?;
+        {
+            let mut insert =
+                tx.prepare("INSERT INTO issue_tag (issue_id, name) VALUES (?1, ?2)")?;
+            for tag in &issue.tags {
+                insert.execute(rusqlite::params![issue.id, tag.as_str()])?;
+            }
+        }
+
+        tx.commit()?;
         Ok(now)
     }
 
@@ -151,6 +203,9 @@ pub mod settings_keys {
     pub const UI_VIEW: &str = "ui.view";
     pub const UI_SELECTED: &str = "ui.selected";
     pub const UI_FILTER: &str = "ui.filter";
+    /// The active Tag filter, or absent when none. Distinct from `UI_VIEW` —
+    /// a Tag filter narrows *within* a View.
+    pub const UI_TAG: &str = "ui.tag";
 }
 
 /// The database file location: `$ISSUE_TRACKER_DB` when set, otherwise the
@@ -194,6 +249,8 @@ fn read_issue(row: &Row<'_>) -> rusqlite::Result<Issue> {
         body: row.get(2)?,
         status: parse_column(&row.get::<_, String>(3)?, 3)?,
         priority: parse_column(&row.get::<_, String>(4)?, 4)?,
+        // Filled in by `load_all`; a single `issue` row knows nothing of them.
+        tags: Vec::new(),
         created_at: parse_timestamp(&row.get::<_, String>(5)?)?,
         updated_at: parse_timestamp(&row.get::<_, String>(6)?)?,
     })
@@ -287,6 +344,97 @@ mod tests {
         let remaining = store.load_all().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, kept.id);
+    }
+
+    fn tag(name: &str) -> Tag {
+        name.parse().expect("valid tag")
+    }
+
+    /// Counts rows in the junction table directly, so cascade behaviour is
+    /// checked against SQLite rather than against our own bookkeeping.
+    fn tag_row_count(store: &Store) -> i64 {
+        store
+            .conn
+            .query_row("SELECT count(*) FROM issue_tag", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn tags_survive_a_reload() {
+        let store = store();
+        let mut issue = store.insert("tagged").unwrap();
+        assert!(issue.tags.is_empty(), "a new Issue starts untagged");
+
+        issue.tags = vec![tag("Bug"), tag("ui")];
+        store.update(&issue).unwrap();
+
+        let reloaded = store.load_all().unwrap().remove(0);
+        assert_eq!(reloaded.tags, vec![tag("Bug"), tag("ui")]);
+    }
+
+    #[test]
+    fn updating_replaces_the_tag_set_rather_than_adding_to_it() {
+        let store = store();
+        let mut issue = store.insert("retagged").unwrap();
+
+        issue.tags = vec![tag("bug"), tag("ui")];
+        store.update(&issue).unwrap();
+        issue.tags = vec![tag("docs")];
+        store.update(&issue).unwrap();
+
+        assert_eq!(store.load_all().unwrap().remove(0).tags, vec![tag("docs")]);
+        assert_eq!(tag_row_count(&store), 1, "the old rows are gone");
+    }
+
+    #[test]
+    fn clearing_every_tag_leaves_no_rows_behind() {
+        let store = store();
+        let mut issue = store.insert("untagged again").unwrap();
+        issue.tags = vec![tag("bug")];
+        store.update(&issue).unwrap();
+
+        issue.tags.clear();
+        store.update(&issue).unwrap();
+
+        assert_eq!(tag_row_count(&store), 0);
+    }
+
+    #[test]
+    fn tags_belong_to_their_own_issue() {
+        let store = store();
+        let mut first = store.insert("first").unwrap();
+        let mut second = store.insert("second").unwrap();
+        first.tags = vec![tag("bug")];
+        second.tags = vec![tag("ui")];
+        store.update(&first).unwrap();
+        store.update(&second).unwrap();
+
+        let loaded = store.load_all().unwrap();
+        let by_id = |id| {
+            loaded
+                .iter()
+                .find(|issue: &&Issue| issue.id == id)
+                .unwrap()
+                .tags
+                .clone()
+        };
+        assert_eq!(by_id(first.id), vec![tag("bug")]);
+        assert_eq!(by_id(second.id), vec![tag("ui")]);
+    }
+
+    #[test]
+    fn deleting_an_issue_takes_its_tags_with_it() {
+        // Relies on the foreign key cascade, which only fires because
+        // `prepare` turns `foreign_keys` on.
+        let store = store();
+        let mut doomed = store.insert("typo").unwrap();
+        doomed.tags = vec![tag("bug"), tag("ui")];
+        store.update(&doomed).unwrap();
+        assert_eq!(tag_row_count(&store), 2);
+
+        store.delete(doomed.id).unwrap();
+
+        assert_eq!(tag_row_count(&store), 0);
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod issue_detail;
 mod issue_list;
 pub mod menus;
 mod sidebar;
+mod tag_colour;
 mod theme;
 mod theme_catalogue;
 mod tracker;

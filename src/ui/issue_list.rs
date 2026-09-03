@@ -4,8 +4,10 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::input::Input;
 use gpui_component::sidebar::SidebarToggleButton;
+use gpui_component::tag::Tag as TagChip;
 use gpui_component::{ActiveTheme, Side, Sizable};
 
+use super::tag_colour::colour_for;
 use super::tracker::{IssueTracker, LIST_CONTEXT};
 use crate::domain::{Issue, Priority};
 
@@ -107,6 +109,7 @@ impl IssueTracker {
         let title = issue.display_title().to_string();
         let status = issue.status;
         let priority = issue.priority;
+        let tags = issue.tags.clone();
 
         div()
             .id(SharedString::from(format!("issue-{id}")))
@@ -152,13 +155,23 @@ impl IssueTracker {
                 div()
                     .flex()
                     .flex_row()
+                    .flex_wrap()
+                    .items_center()
                     .gap_2()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(status.label())
                     .when(priority != Priority::None, |this| {
                         this.child(priority.label())
-                    }),
+                    })
+                    // Colour is most of why a Tag is legible here at all —
+                    // without it these are more grey text competing with the
+                    // Status beside them.
+                    .children(tags.into_iter().map(|tag| {
+                        TagChip::color(colour_for(&tag))
+                            .xsmall()
+                            .child(tag.as_str().to_owned())
+                    })),
             )
     }
 }
