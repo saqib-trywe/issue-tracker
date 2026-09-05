@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Pure domain types.
 //!
 //! This module must not depend on `gpui` or `rusqlite`. Keeping it free of

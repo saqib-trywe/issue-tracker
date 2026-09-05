@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Keeps the app's appearance in step with the operating system.
 //!
 //! `gpui_component::init` pins the theme to Light unconditionally, so without

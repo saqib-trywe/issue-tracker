@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The local HTTP API.
 //!
 //! Everything in this module is free of `gpui`: it depends on `domain` and

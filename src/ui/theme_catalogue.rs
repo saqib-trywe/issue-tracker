@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The set of named themes the user can choose from.
 //!
 //! Theme files are embedded at compile time from `assets/themes/`. Each file

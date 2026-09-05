@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Root view: selection, filters and editing state, rendered from the shared
 //! Projection. The three columns are rendered by sibling modules.
 //!

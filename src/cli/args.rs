@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! `argv` in, a [`Command`] out. No I/O, so every rule here is a unit test.
 //!
 //! Enum values are parsed here rather than passed through as text: the CLI and

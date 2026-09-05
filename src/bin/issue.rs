@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The `issue` command. Everything is in `issue_tracker::cli`, so the same
 //! code can be driven from an integration test without spawning a process.
 

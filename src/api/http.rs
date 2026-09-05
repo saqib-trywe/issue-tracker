@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! A small HTTP/1.1 request reader and response writer.
 //!
 //! Deliberately hand-rolled and synchronous. The API has a handful of

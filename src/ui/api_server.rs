@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The listening socket for the local HTTP API, and the bridge onto the main
 //! thread.
 //!

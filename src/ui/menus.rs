@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The macOS application menu.
 //!
 //! Menu items dispatch actions, so anything reachable from a menu also needs

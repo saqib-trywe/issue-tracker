@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Left column: the View list.
 
 use gpui::prelude::FluentBuilder;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The parts of the issue tracker that do not draw anything.
 //!
 //! `domain` holds pure types, `store` persists them, `projection` is the

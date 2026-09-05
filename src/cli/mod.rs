@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! `issue` — the command-line surface.
 //!
 //! A *client* of the local HTTP API, never a second writer: everything goes

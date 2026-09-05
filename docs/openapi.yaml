@@ -4,6 +4,10 @@ info:
   title: Issues — local HTTP API
   version: 0.1.1
   summary: The local API of the `Issues` desktop app, served only while the app is running.
+  license:
+    name: GNU General Public License v3.0 only
+    identifier: GPL-3.0-only
+
   description: |
     A small HTTP/1.1 API over loopback, exposed by the `Issues` desktop
     application so scripts and the `issue` CLI can read and change the same

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! App-level ownership of the [`Store`] and the in-memory Issue list.
 //!
 //! This is the single writer. Both the UI and the HTTP API mutate through it,

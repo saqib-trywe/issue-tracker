@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The shared [`Projection`], held for the life of the process.
 //!
 //! It lives here rather than on the window because the HTTP API has to answer

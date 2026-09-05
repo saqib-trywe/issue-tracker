@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Middle column: the filterable, keyboard-navigable Issue list.
 
 use gpui::prelude::FluentBuilder;

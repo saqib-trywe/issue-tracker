@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The view layer.
 //!
 //! `tracker` owns all state; the other modules are `impl IssueTracker` blocks

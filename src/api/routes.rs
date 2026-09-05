@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Endpoint matching and the handlers behind it.
 //!
 //! Routing is written out by hand rather than delegated to a framework,

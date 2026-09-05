@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Deterministic colours for Tags.
 //!
 //! Derived Tags have nowhere to store a chosen colour — there is no `tag` row

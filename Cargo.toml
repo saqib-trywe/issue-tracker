@@ -2,6 +2,7 @@
 name = "gpui-issue-tracker-ui"
 version = "0.1.1"
 edition = "2024"
+license = "GPL-3.0-only"
 # Two binaries, so `cargo run` needs telling which one it means.
 default-run = "Issues"
 

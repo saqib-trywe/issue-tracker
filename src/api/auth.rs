@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Who is allowed to talk to the API.
 //!
 //! On loopback a token protects nothing from a process running as you — that

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Schema migrations.
 //!
 //! `rusqlite_migration` tracks the applied version in SQLite's `user_version`

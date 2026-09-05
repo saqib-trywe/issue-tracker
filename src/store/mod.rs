@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! SQLite persistence for Issues.
 //!
 //! The UI keeps every Issue in memory and calls through here on mutation, so

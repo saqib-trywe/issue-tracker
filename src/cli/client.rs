@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! A blocking HTTP client for one server, on one host, over one socket.
 //!
 //! Hand-rolled for the same reason the server was: everything here is

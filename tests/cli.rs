@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! End to end over a real socket, against a stub that speaks the API's
 //! responses.
 //!

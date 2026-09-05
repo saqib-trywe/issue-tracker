@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Right column: inline editing of the selected Issue.
 //!
 //! Edits auto-save on a debounce; there is no save button. Status and

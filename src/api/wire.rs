@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The JSON shapes on the wire, and their translation to domain types.
 //!
 //! Enum values are spelled exactly as [`Status::label`] and

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Turning API responses into text.
 //!
 //! Pure with respect to the network: everything here takes already-fetched
