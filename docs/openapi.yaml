@@ -1,0 +1,737 @@
+openapi: 3.1.0
+
+info:
+  title: Issues — local HTTP API
+  version: 0.1.1
+  summary: The local API of the `Issues` desktop app, served only while the app is running.
+  description: |
+    A small HTTP/1.1 API over loopback, exposed by the `Issues` desktop
+    application so scripts and the `issue` CLI can read and change the same
+    Issues the window is showing. It is **not** a general-purpose service:
+
+    * It exists only while the app is running. There is no daemon, and no
+      client may open the SQLite database itself — the app is the single
+      writer. See `docs/adr/0008`.
+    * It binds `127.0.0.1` only, and refuses anything that looks like it came
+      from a browser. See the `bearer` security scheme below and `docs/adr/0006`.
+    * It speaks domain operations only. Nothing about the window — the
+      selection, the active View, the theme — is reachable here.
+
+    Every response body is JSON, including every error, which is always
+    `{"error": "<one human-readable sentence>"}`. The server writes
+    `Connection: close` and serves one request per connection.
+
+    ## Finding the server
+
+    The port and token are published to `api.json`, beside the database, mode
+    `0600`, and the token is regenerated on every launch — so a client must
+    **read that file** rather than hardcode either value:
+
+    ```json
+    { "port": 8787, "token": "…64 hex characters…" }
+    ```
+
+    On macOS that is
+    `~/Library/Application Support/gpui-issue-tracker/api.json`, or beside
+    whatever `ISSUE_TRACKER_DB` names. Port 8787 is only preferred: if it is
+    taken, an ephemeral port is used, which is why the file is authoritative.
+
+    A file that exists when the app does not is stale — `api.json` is removed
+    on a clean quit, but not when the process is killed — so a connection
+    refused against a published port means the same thing as no file at all.
+
+servers:
+  - url: http://127.0.0.1:{port}
+    description: The running app. Take `port` from `api.json`; do not assume 8787.
+    variables:
+      port:
+        default: '8787'
+
+security:
+  - bearer: []
+
+tags:
+  - name: issues
+    description: Filing, reading, changing and deleting Issues.
+  - name: tags
+    description: >
+      Tags are derived from use — a Tag exists exactly as long as some Issue
+      carries it, so there is nothing to create or delete on its own.
+      See `docs/adr/0004`.
+  - name: sub-issues
+    description: >
+      An Issue may be part of one other Issue, exactly one level deep.
+      See `docs/adr/0007`.
+
+paths:
+  /issues:
+    get:
+      operationId: listIssues
+      tags: [issues]
+      summary: List Issues
+      description: |
+        Returns Issues in the same display order the window uses, so "the
+        first one" means the same thing in both. All four filters compose;
+        omitting one does not narrow.
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Exactly one Status. Matched without regard to case.
+          schema:
+            $ref: '#/components/schemas/Status'
+          example: Doing
+        - name: tag
+          in: query
+          required: false
+          description: >
+            One Tag name. Matched without regard to case, since `Bug` and
+            `bug` are the same Tag.
+          schema:
+            type: string
+          example: bug
+        - name: parent
+          in: query
+          required: false
+          description: |
+            Either the id of an Issue — returning its sub-issues — or the
+            literal `none`, returning only Issues that are not part of
+            anything. `none` is spelled out rather than left empty because an
+            empty value is what a client sends by accident when a variable was
+            never set; `?parent=` is a 400.
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/IssueId'
+              - type: string
+                const: none
+          example: none
+        - name: q
+          in: query
+          required: false
+          description: >
+            A substring of the title, matched without regard to case.
+            Titles only — never bodies, never Tags.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching Issues, in display order. An empty list is not an error.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Issue'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      operationId: createIssue
+      tags: [issues]
+      summary: File an Issue
+      description: |
+        Only `title` is required; everything else may be applied in the same
+        call, so automation never needs a second round-trip to file a
+        fully-specified Issue.
+
+        `parent_id` is accepted **here** — at creation "absent" unambiguously
+        means "no parent", which is the ambiguity that keeps it out of `PATCH`.
+        It is applied after the Issue is created and goes through exactly the
+        checks an attach would, so a refusal leaves the Issue filed but
+        unparented.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewIssue'
+            examples:
+              minimal:
+                summary: Just a title
+                value:
+                  title: The list flickers on first paint
+              full:
+                summary: Everything in one call
+                value:
+                  title: Write the client
+                  body: Hand-rolled over TcpStream; no tokio in this process.
+                  status: Doing
+                  priority: High
+                  tags: [cli, ui]
+                  parent_id: 1
+      responses:
+        '201':
+          description: Filed.
+          headers:
+            Location:
+              description: Where the new Issue lives, e.g. `/issues/12`.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issue'
+        '400':
+          description: |
+            A blank title, an unknown Status, Priority or unusable Tag name,
+            or a malformed body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The named `parent_id` does not exist. The Issue was still created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: >
+            The named parent is itself a sub-issue, or is Done or Cancelled.
+            The Issue was still created, unparented.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /issues/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IssueIdPath'
+    get:
+      operationId: getIssue
+      tags: [issues]
+      summary: Read one Issue
+      responses:
+        '200':
+          description: The Issue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: patchIssue
+      tags: [issues]
+      summary: Change named fields of an Issue
+      description: |
+        A field that is absent is left alone, which is what stops a caller
+        setting a Status from rewriting a title someone else is editing. A
+        patch that changes nothing writes nothing, so `updated_at` does not
+        move for a no-op — and an absent body reads as `{}`, so `PATCH` with
+        nothing to say succeeds rather than failing to parse.
+
+        `tags` is the exception to field-level safety: it **replaces** the
+        whole set. Changing one Tag through it is a read-modify-write, which
+        is what `PUT`/`DELETE /issues/{id}/tags/{name}` exists to avoid.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssuePatch'
+            examples:
+              status:
+                summary: Move it along
+                value:
+                  status: Done
+              clearTags:
+                summary: Remove every Tag (distinct from leaving them alone)
+                value:
+                  tags: []
+      responses:
+        '200':
+          description: The Issue as it now stands.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issue'
+        '400':
+          description: >
+            An unknown Status or Priority, an unusable Tag name, a malformed
+            body, or `parent_id` — which is refused with a pointer to the
+            sub-issue endpoints rather than ignored, since a caller who
+            thought they had moved an Issue would otherwise have no way to
+            tell they had not.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            The change is refused by a rule. Both directions of the completion
+            rule land here: a parent cannot go Done above outstanding
+            sub-issues, and a sub-issue cannot be reopened under a settled
+            parent. Done and Cancelled both count as settled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: 2 sub-issue(s) are still outstanding
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+    delete:
+      operationId: deleteIssue
+      tags: [issues]
+      summary: Delete an Issue
+      description: >
+        Deleting a parent orphans its sub-issues rather than taking them with
+        it — they survive, unparented.
+      responses:
+        '204':
+          description: Deleted. No body.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /issues/{id}/tags/{name}:
+    parameters:
+      - $ref: '#/components/parameters/IssueIdPath'
+      - name: name
+        in: path
+        required: true
+        description: |
+          The Tag name, matched without regard to case: `Bug` and `bug` are
+          the same Tag, and the spelling already in use is the one kept.
+
+          The name is the **whole remainder of the path**, slashes included,
+          so `/issues/3/tags/ui/theme` addresses the Tag `ui/theme`.
+          Percent-encoding it (`ui%2Ftheme`) addresses the same Tag, since the
+          path is decoded before it is routed — which is what makes ordinary
+          URL-encoding clients work despite the unusual shape.
+        schema:
+          type: string
+        example: ui/theme
+    put:
+      operationId: addTag
+      tags: [tags]
+      summary: Add one Tag to an Issue
+      description: >
+        Idempotent, and single-Tag by design: unlike `PATCH {tags: […]}` this
+        cannot clobber a Tag added by another writer between a read and a write.
+      responses:
+        '200':
+          description: The Issue, with the Tag present.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issue'
+        '400':
+          description: The name is empty after trimming, over 50 characters, or holds a control character.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/ServerError'
+    delete:
+      operationId: removeTag
+      tags: [tags]
+      summary: Remove one Tag from an Issue
+      description: >
+        Idempotent: removing a Tag the Issue does not carry still succeeds.
+        A Tag carried by no Issue ceases to exist, since Tags are derived.
+      responses:
+        '200':
+          description: The Issue, with the Tag absent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issue'
+        '400':
+          description: The name is unusable as a Tag.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /issues/{parent}/sub-issues/{child}:
+    parameters:
+      - name: parent
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/IssueId'
+      - name: child
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/IssueId'
+    put:
+      operationId: attachSubIssue
+      tags: [sub-issues]
+      summary: Make one Issue part of another
+      description: |
+        Attaching an Issue that already has a parent **moves** it; there is no
+        separate move operation, because the request already says where the
+        child should end up. No body.
+      responses:
+        '200':
+          description: The child, with its new `parent_id`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Either end does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: |
+            Refused by a rule, not a lookup failure:
+
+            * an Issue cannot be its own parent;
+            * the hierarchy is exactly one level deep, refused from both ends
+              — a sub-issue cannot take children, and an Issue that has
+              children cannot become one;
+            * an outstanding child cannot be attached under a settled parent,
+              nor a child attached to a parent already Done.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/ServerError'
+    delete:
+      operationId: detachSubIssue
+      tags: [sub-issues]
+      summary: Detach a sub-issue from its parent
+      description: The child survives, unparented. No body.
+      responses:
+        '200':
+          description: The child, with `parent_id` now null.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Issue'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: The child does not exist.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: >
+            The child is not a sub-issue of that parent. Reported rather than
+            silently succeeding, because a caller detaching from the wrong
+            parent has made a mistake worth hearing about.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: '#7 is not a sub-issue of #3'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /tags:
+    get:
+      operationId: listTags
+      tags: [tags]
+      summary: List the Tags in use
+      description: >
+        The same derived list the sidebar shows, with the same counts, sorted
+        by the Tag's own case-insensitive order. A Tag carried by no Issue does
+        not appear, because it does not exist.
+      responses:
+        '200':
+          description: Every Tag in use.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Tag'
+              example:
+                - name: Bug
+                  count: 2
+                - name: ui
+                  count: 1
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: |
+        The token from `api.json`, sent as `Authorization: Bearer <token>`. It
+        is 32 random bytes as hex, regenerated on every launch, and compared in
+        constant time.
+
+        On loopback a token protects nothing from a process running as you —
+        that process can read the database file directly. What it defeats is
+        the one attacker that cannot: a web page. Two further checks exist for
+        that same attacker, and a client must satisfy both:
+
+        * **Send no `Origin` header.** Only a browser sends one, so its mere
+          presence is disqualifying — 403, even with a valid token.
+        * **Send a loopback `Host`.** `127.0.0.1`, `localhost` or `::1`, with
+          or without a port. This defeats DNS rebinding, where an attacker
+          points their own hostname at 127.0.0.1 and it arrives in `Host`.
+
+  parameters:
+    IssueIdPath:
+      name: id
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/IssueId'
+
+  responses:
+    BadRequest:
+      description: The request could not be understood or a value was not valid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: The bearer token was missing or wrong.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+            const: Bearer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: a valid bearer token is required
+    Forbidden:
+      description: >
+        The request carried an `Origin` header, or was not addressed to
+        localhost. Both mean a browser is calling, which this API never serves.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: this API does not serve browser requests
+    NotFound:
+      description: No Issue with that id.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: no issue #99
+    ServerError:
+      description: The database write failed. Distinct from a refusal, which is 409.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    IssueId:
+      type: integer
+      format: int64
+      minimum: 1
+      examples: [3]
+
+    Status:
+      type: string
+      description: >
+        Accepted without regard to case on the way in; always spelled exactly
+        like this on the way out, which is also how the database and the UI
+        spell it. Done and Cancelled both count as settled.
+      enum: [Todo, Doing, Blocked, Done, Cancelled]
+
+    Priority:
+      type: string
+      description: Accepted without regard to case on the way in, spelled like this on the way out.
+      enum: [None, Low, Medium, High, Urgent]
+
+    Issue:
+      type: object
+      description: An Issue as it goes out. Every field is always present.
+      required:
+        [id, title, body, status, priority, tags, parent_id, sub_issue_ids, created_at, updated_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/IssueId'
+        title:
+          type: string
+        body:
+          type: string
+          description: Free text. May be empty; never null.
+        status:
+          $ref: '#/components/schemas/Status'
+        priority:
+          $ref: '#/components/schemas/Priority'
+        tags:
+          type: array
+          description: The Tag names this Issue carries, in the Tags' own order.
+          items:
+            type: string
+        parent_id:
+          description: >
+            The Issue this one is part of, if any. **Read-only here** — attach
+            and detach go through `PUT`/`DELETE /issues/{parent}/sub-issues/{child}`.
+          oneOf:
+            - $ref: '#/components/schemas/IssueId'
+            - type: 'null'
+        sub_issue_ids:
+          type: array
+          description: >
+            The Issues that are part of this one, in display order. Read-only,
+            and never more than one level deep — a sub-issue's own list is
+            always empty.
+          items:
+            $ref: '#/components/schemas/IssueId'
+        created_at:
+          type: string
+          format: date-time
+          description: RFC 3339, UTC, microsecond precision.
+          examples: ['2026-09-05T09:14:02.481221Z']
+        updated_at:
+          type: string
+          format: date-time
+          description: >
+            Moves on any change that actually changed something, including a
+            Tag added or removed. A no-op patch leaves it where it was.
+          examples: ['2026-09-05T09:20:44.010933Z']
+      examples:
+        - id: 1
+          title: Ship the CLI
+          body: ''
+          status: Doing
+          priority: High
+          tags: [cli]
+          parent_id: null
+          sub_issue_ids: [2, 3]
+          created_at: '2026-09-05T09:14:02.481221Z'
+          updated_at: '2026-09-05T09:20:44.010933Z'
+
+    IssuePatch:
+      type: object
+      description: >
+        Every field is optional, and an absent one is left alone. Sending `{}`,
+        or no body at all, is a no-op that succeeds.
+      properties:
+        title:
+          type: string
+        body:
+          type: string
+        status:
+          $ref: '#/components/schemas/Status'
+        priority:
+          $ref: '#/components/schemas/Priority'
+        tags:
+          type: array
+          description: >
+            **Replaces** the whole set — `[]` clears every Tag, which is
+            distinct from omitting the field. Names fold case against the Tags
+            already in use, so an existing spelling wins.
+          items:
+            type: string
+
+    NewIssue:
+      type: object
+      description: >
+        An `IssuePatch` plus the two things only creation takes: a required
+        title, and an optional parent.
+      required: [title]
+      properties:
+        title:
+          type: string
+          description: Trimmed. Must not be blank.
+        body:
+          type: string
+        status:
+          $ref: '#/components/schemas/Status'
+        priority:
+          $ref: '#/components/schemas/Priority'
+        tags:
+          type: array
+          items:
+            type: string
+        parent_id:
+          description: >
+            The only place `parent_id` is writable. `PATCH` refuses it, so a
+            move after the fact goes through the sub-issue endpoints.
+          oneOf:
+            - $ref: '#/components/schemas/IssueId'
+            - type: 'null'
+
+    Tag:
+      type: object
+      description: >
+        A Tag is derived from use, so it has no id and no lifecycle of its
+        own — only a name and how many Issues carry it.
+      required: [name, count]
+      properties:
+        name:
+          type: string
+          description: The spelling first used. Identity ignores case.
+        count:
+          type: integer
+          minimum: 1
+          description: How many Issues carry it. Never zero — a Tag with no Issues does not exist.
+
+    Error:
+      type: object
+      description: The shape of every failure, at every status.
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: One human-readable sentence, suitable for showing to a person unedited.
+      examples:
+        - error: 'parent_id is not patchable; use PUT or DELETE /issues/{parent}/sub-issues/7'
