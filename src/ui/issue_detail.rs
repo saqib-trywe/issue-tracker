@@ -14,7 +14,7 @@ use gpui_component::{ActiveTheme, Disableable, Icon, IconName, Sizable, WindowEx
 
 use super::tag_colour::colour_for;
 use super::tracker::IssueTracker;
-use crate::domain::{Issue, IssueId, Priority, Status, Tag};
+use issue_tracker::domain::{Issue, IssueId, Priority, Status, Tag};
 
 impl IssueTracker {
     pub(super) fn render_issue_detail(

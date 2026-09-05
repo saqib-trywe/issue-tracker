@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{Issue, IssueId, ParseError, Priority, Status, Tag};
 use crate::projection::IssuePatch;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct IssueJson {
     pub id: IssueId,
     pub title: String,
@@ -57,7 +57,7 @@ fn timestamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TagJson {
     pub name: String,
     pub count: usize,

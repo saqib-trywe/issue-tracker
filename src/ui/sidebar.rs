@@ -9,7 +9,7 @@ use gpui_component::{ActiveTheme, Sizable};
 use super::tag_colour::colour_for;
 use super::theme_catalogue::ThemeListDelegate;
 use super::tracker::IssueTracker;
-use crate::domain::{Tag, View};
+use issue_tracker::domain::{Tag, View};
 
 impl IssueTracker {
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {

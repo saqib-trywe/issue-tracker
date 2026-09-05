@@ -10,7 +10,7 @@
 mod auth;
 mod http;
 mod routes;
-mod wire;
+pub mod wire;
 
 pub use http::{Parsed, Request, Response, parse};
 

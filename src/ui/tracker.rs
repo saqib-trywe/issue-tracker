@@ -18,9 +18,9 @@ use gpui_component::searchable_list::SearchableVec;
 use gpui_component::select::{SelectEvent, SelectState};
 
 use super::theme_catalogue::{ThemeCatalogue, ThemeListDelegate};
-use crate::domain::{Issue, IssueId, Priority, Status, Tag, View};
-use crate::projection::{IssuePatch, Projection, Written};
-use crate::store::settings_keys;
+use issue_tracker::domain::{Issue, IssueId, Priority, Status, Tag, View};
+use issue_tracker::projection::{IssuePatch, Projection, Written};
+use issue_tracker::store::settings_keys;
 
 /// The Tag editor in the detail pane. Tags are plain names, so the delegate is
 /// the library's own `SearchableVec` and no custom one is needed.

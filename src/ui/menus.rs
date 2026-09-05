@@ -12,7 +12,7 @@ use super::tracker::{
     CloseWindow, CreateIssue, DeleteIssue, Hide, HideOthers, Minimize, Quit, ShowView,
     ToggleSidebar, Zoom,
 };
-use crate::domain::View;
+use issue_tracker::domain::View;
 
 /// Installs the menu bar for the given active View.
 ///

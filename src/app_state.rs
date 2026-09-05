@@ -6,7 +6,7 @@
 
 use gpui::{App, Entity, Global};
 
-use crate::projection::Projection;
+use issue_tracker::projection::Projection;
 
 struct GlobalProjection(Entity<Projection>);
 

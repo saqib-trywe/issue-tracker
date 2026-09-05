@@ -2,6 +2,15 @@
 name = "gpui-issue-tracker-ui"
 version = "0.1.1"
 edition = "2024"
+# Two binaries, so `cargo run` needs telling which one it means.
+default-run = "Issues"
+
+# The shared core: domain rules, storage, the projection and the HTTP API.
+# It deliberately does not contain `ui` or `app_state`, so nothing in here can
+# reach back into the view — see docs/adr/0008.
+[lib]
+name = "issue_tracker"
+path = "src/lib.rs"
 
 # macOS titles the application menu from the process name, ignoring the name
 # given to the first `Menu`. Naming the binary is what makes the menu bar read
@@ -9,6 +18,11 @@ edition = "2024"
 [[bin]]
 name = "Issues"
 path = "src/main.rs"
+
+# The command-line surface. A client of the API above, not a second writer.
+[[bin]]
+name = "issue"
+path = "src/bin/issue.rs"
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
@@ -29,3 +43,8 @@ serde_json = "1.0.151"
 httparse = "1"
 getrandom = "0.3"
 async-channel = "2"
+# The CLI. Both were already in the lock file by way of the Zed tree, so
+# neither adds a compile unit. `pico-args` generates no help text; ours is
+# written by hand. See docs/adr/0008.
+pico-args = "0.5"
+termcolor = "1"

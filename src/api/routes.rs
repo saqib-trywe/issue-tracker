@@ -103,8 +103,26 @@ pub fn dispatch(request: &Request, projection: &mut Projection) -> Response {
 
 // ---- handlers ---------------------------------------------------------------
 
-/// `GET /issues`, with the same three narrowings the UI offers: a Status
-/// slice, a Tag filter, and a title substring.
+/// What `?parent=` asked for.
+enum ParentFilter {
+    /// `?parent=none` — only Issues that are not part of anything.
+    Unparented,
+    /// `?parent=7` — the sub-issues of one Issue.
+    Under(IssueId),
+}
+
+impl ParentFilter {
+    fn matches(&self, issue: &Issue) -> bool {
+        match self {
+            ParentFilter::Unparented => issue.parent_id.is_none(),
+            ParentFilter::Under(parent) => issue.parent_id == Some(*parent),
+        }
+    }
+}
+
+/// `GET /issues`, with the narrowings the UI offers — a Status slice, a Tag
+/// filter and a title substring — plus a parent filter the UI expresses
+/// through the shape of its rows rather than as a control.
 fn list_issues(request: &Request, projection: &Projection) -> Response {
     let status = match request.param("status").map(str::parse::<Status>) {
         Some(Ok(status)) => Some(status),
@@ -114,6 +132,18 @@ fn list_issues(request: &Request, projection: &Projection) -> Response {
     let tag = match request.param("tag").map(str::parse::<Tag>) {
         Some(Ok(tag)) => Some(tag),
         Some(Err(err)) => return Response::error(400, err),
+        None => None,
+    };
+    // `none` is a literal rather than an empty value, because an empty one is
+    // what a client sends by accident when a variable was never set.
+    let parent = match request.param("parent") {
+        Some("none") => Some(ParentFilter::Unparented),
+        Some(raw) => match raw.parse::<IssueId>() {
+            Ok(id) => Some(ParentFilter::Under(id)),
+            Err(_) => {
+                return Response::error(400, format!("parent must be an id or \"none\": {raw}"));
+            }
+        },
         None => None,
     };
     let needle = request
@@ -128,6 +158,7 @@ fn list_issues(request: &Request, projection: &Projection) -> Response {
         .iter()
         .filter(|issue| status.is_none_or(|status| issue.status == status))
         .filter(|issue| tag.as_ref().is_none_or(|tag| issue.tags.contains(tag)))
+        .filter(|issue| parent.as_ref().is_none_or(|parent| parent.matches(issue)))
         .filter(|issue| {
             needle
                 .as_ref()
@@ -508,6 +539,41 @@ mod tests {
     fn a_bad_filter_value_is_a_400() {
         let mut p = projection();
         assert_eq!(send(&mut p, "GET", "/issues?status=Nope", "").status, 400);
+        assert_eq!(send(&mut p, "GET", "/issues?parent=", "").status, 400);
+        assert_eq!(send(&mut p, "GET", "/issues?parent=all", "").status, 400);
+    }
+
+    #[test]
+    fn listing_narrows_by_parent() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        let child = make(&mut p, "child");
+        let loner = make(&mut p, "loner");
+        p.set_parent(child, Some(parent)).unwrap();
+
+        let under = send(&mut p, "GET", &format!("/issues?parent={parent}"), "");
+        assert_eq!(json(&under).as_array().unwrap().len(), 1);
+        assert_eq!(json(&under)[0]["id"], child);
+
+        // The other half of the same question: what is not part of anything.
+        let top = send(&mut p, "GET", "/issues?parent=none", "");
+        let ids: Vec<i64> = json(&top)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|issue| issue["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&parent) && ids.contains(&loner));
+
+        // Composes with the other filters rather than replacing them.
+        let none = send(
+            &mut p,
+            "GET",
+            &format!("/issues?parent={parent}&q=loner"),
+            "",
+        );
+        assert!(json(&none).as_array().unwrap().is_empty());
     }
 
     #[test]

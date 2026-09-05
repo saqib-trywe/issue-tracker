@@ -1,15 +1,12 @@
-mod api;
 mod app_state;
-mod domain;
-mod projection;
-mod store;
 mod ui;
 
 use gpui::*;
 use gpui_component::Root;
 
-use projection::Projection;
-use store::Store;
+use issue_tracker::domain;
+use issue_tracker::projection::Projection;
+use issue_tracker::store::Store;
 use ui::IssueTracker;
 
 /// Opens the main window.

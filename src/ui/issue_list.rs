@@ -9,7 +9,7 @@ use gpui_component::{ActiveTheme, Side, Sizable};
 
 use super::tag_colour::colour_for;
 use super::tracker::{IssueTracker, LIST_CONTEXT};
-use crate::domain::{IssueId, Priority, Status, Tag};
+use issue_tracker::domain::{IssueId, Priority, Status, Tag};
 
 impl IssueTracker {
     pub(super) fn render_issue_list(

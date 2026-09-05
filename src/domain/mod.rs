@@ -77,13 +77,18 @@ impl fmt::Display for Status {
     }
 }
 
+/// Case-insensitive, so `done` and `Done` are the same Status.
+///
+/// Tag identity already folds case deliberately; Status matching exactly was
+/// the inconsistency. The database only ever holds canonical labels, so this
+/// widens what is accepted without changing what is stored.
 impl FromStr for Status {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Status::ALL
             .into_iter()
-            .find(|status| status.label() == s)
+            .find(|status| status.label().eq_ignore_ascii_case(s))
             .ok_or_else(|| ParseError {
                 kind: "status",
                 value: s.to_owned(),
@@ -131,13 +136,14 @@ impl fmt::Display for Priority {
     }
 }
 
+/// Case-insensitive, for the reason given on [`Status`]'s implementation.
 impl FromStr for Priority {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Priority::ALL
             .into_iter()
-            .find(|priority| priority.label() == s)
+            .find(|priority| priority.label().eq_ignore_ascii_case(s))
             .ok_or_else(|| ParseError {
                 kind: "priority",
                 value: s.to_owned(),
@@ -394,6 +400,27 @@ mod tests {
     fn priority_round_trips_through_text() {
         for priority in Priority::ALL {
             assert_eq!(priority.to_string().parse::<Priority>().unwrap(), priority);
+        }
+    }
+
+    #[test]
+    fn status_and_priority_fold_case() {
+        // What a terminal user types, and what the API therefore accepts.
+        assert_eq!("done".parse::<Status>().unwrap(), Status::Done);
+        assert_eq!("CANCELLED".parse::<Status>().unwrap(), Status::Cancelled);
+        assert_eq!("urgent".parse::<Priority>().unwrap(), Priority::Urgent);
+        // Folding must not make two variants collide.
+        for status in Status::ALL {
+            assert_eq!(
+                status.label().to_lowercase().parse::<Status>().unwrap(),
+                status
+            );
+        }
+        for priority in Priority::ALL {
+            assert_eq!(
+                priority.label().to_lowercase().parse::<Priority>().unwrap(),
+                priority
+            );
         }
     }
 
