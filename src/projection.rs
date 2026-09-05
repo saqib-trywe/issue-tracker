@@ -224,8 +224,47 @@ impl Projection {
     }
 
     /// Whether `id` may be marked Done right now.
-    pub fn can_be_done(&self, id: IssueId) -> bool {
+    fn can_be_done(&self, id: IssueId) -> bool {
         self.outstanding_count(id) == 0
+    }
+
+    /// Whether `child` may be attached under `parent`, and why not.
+    ///
+    /// The single statement of the attachment rules. [`Self::set_parent`]
+    /// enforces them and the two `eligible_*` methods offer them as a list:
+    /// stated once, in refusal form, with the predicate form falling out of it
+    /// rather than restating it. Written twice they had already diverged —
+    /// `eligible_sub_issues` never checked whether the proposed parent was
+    /// itself a sub-issue, and was correct only because the detail pane
+    /// declines to show that picker.
+    fn may_attach(&self, child: IssueId, parent: IssueId) -> std::result::Result<(), WriteError> {
+        if self.get(child).is_none() {
+            return Err(WriteError::NotFound(child));
+        }
+        if parent == child {
+            return Err(Refused::SelfParent.into());
+        }
+        let Some(target) = self.get(parent) else {
+            return Err(WriteError::NotFound(parent));
+        };
+
+        // One level deep, checked from both ends.
+        if target.parent_id.is_some() {
+            return Err(Refused::ParentIsSubIssue(parent).into());
+        }
+        if !self.sub_issues(child).is_empty() {
+            return Err(Refused::ChildHasSubIssues(child).into());
+        }
+
+        // A Done parent may not take on work that is still outstanding.
+        let child_settled = self
+            .get(child)
+            .is_some_and(|issue| issue.status.is_settled());
+        if target.status == Status::Done && !child_settled {
+            return Err(Refused::ParentAlreadyDone(parent).into());
+        }
+
+        Ok(())
     }
 
     /// Issues that could become sub-issues of `parent`.
@@ -234,34 +273,19 @@ impl Projection {
     /// moves it — so callers must show the current parent rather than let a
     /// pick quietly empty another Issue.
     pub fn eligible_sub_issues(&self, parent: IssueId) -> Vec<&Issue> {
-        let parent_is_done = self
-            .get(parent)
-            .is_some_and(|issue| issue.status == Status::Done);
         self.issues
             .iter()
-            .filter(|issue| issue.id != parent)
+            // Already there: offering it again would be a move to where it is.
             .filter(|issue| issue.parent_id != Some(parent))
-            // One level deep: something with its own parts cannot become one.
-            .filter(|issue| self.sub_issues(issue.id).is_empty())
-            // A Done parent cannot take on outstanding work.
-            .filter(|issue| !parent_is_done || issue.status.is_settled())
+            .filter(|issue| self.may_attach(issue.id, parent).is_ok())
             .collect()
     }
 
     /// Issues that `child` could be made part of.
     pub fn eligible_parents(&self, child: IssueId) -> Vec<&Issue> {
-        // Something with its own parts cannot be filed under anything.
-        if !self.sub_issues(child).is_empty() {
-            return Vec::new();
-        }
-        let child_settled = self
-            .get(child)
-            .is_some_and(|issue| issue.status.is_settled());
         self.issues
             .iter()
-            .filter(|issue| issue.id != child)
-            .filter(|issue| issue.parent_id.is_none())
-            .filter(|issue| child_settled || issue.status != Status::Done)
+            .filter(|issue| self.may_attach(child, issue.id).is_ok())
             .collect()
     }
 
@@ -367,26 +391,7 @@ impl Projection {
         }
 
         if let Some(parent) = parent {
-            if parent == child {
-                return Err(Refused::SelfParent.into());
-            }
-            let Some(target) = self.get(parent) else {
-                return Err(WriteError::NotFound(parent));
-            };
-            // One level deep, checked from both ends.
-            if target.parent_id.is_some() {
-                return Err(Refused::ParentIsSubIssue(parent).into());
-            }
-            if !self.sub_issues(child).is_empty() {
-                return Err(Refused::ChildHasSubIssues(child).into());
-            }
-            let target_done = target.status == Status::Done;
-            let child_settled = self
-                .get(child)
-                .is_some_and(|issue| issue.status.is_settled());
-            if target_done && !child_settled {
-                return Err(Refused::ParentAlreadyDone(parent).into());
-            }
+            self.may_attach(child, parent)?;
         }
 
         let issue = self
@@ -475,6 +480,106 @@ mod tests {
 
     fn tag(name: &str) -> Tag {
         name.parse().expect("valid tag")
+    }
+
+    fn filed(p: &mut Projection, title: &str) -> IssueId {
+        p.create(title, IssuePatch::default()).unwrap().id
+    }
+
+    /// Every eligibility answer must match the refusal that would follow.
+    ///
+    /// This is the property the two forms of the rule exist to share: a
+    /// picker that offers something the writer would refuse is a control that
+    /// fails on click, and one that hides something the writer would accept
+    /// is work you cannot do.
+    fn offers_agree_with_refusals(p: &Projection) {
+        let ids: Vec<IssueId> = p.issues().iter().map(|issue| issue.id).collect();
+        for &parent in &ids {
+            let offered: Vec<IssueId> = p
+                .eligible_sub_issues(parent)
+                .iter()
+                .map(|issue| issue.id)
+                .collect();
+            for &child in &ids {
+                let allowed = p.may_attach(child, parent).is_ok();
+                // Something already under this parent is withheld from the
+                // list without being refused: attaching it would be a move to
+                // where it already is.
+                let already_there = p.get(child).and_then(|issue| issue.parent_id) == Some(parent);
+                assert_eq!(
+                    offered.contains(&child),
+                    allowed && !already_there,
+                    "sub-issue offer for #{child} under #{parent}"
+                );
+            }
+        }
+        for &child in &ids {
+            let offered: Vec<IssueId> = p
+                .eligible_parents(child)
+                .iter()
+                .map(|issue| issue.id)
+                .collect();
+            for &parent in &ids {
+                assert_eq!(
+                    offered.contains(&parent),
+                    p.may_attach(child, parent).is_ok(),
+                    "parent offer of #{parent} for #{child}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sub_issue_is_never_offered_anything_to_hold() {
+        // The gap: this used to return a full list for a parent that was
+        // itself a sub-issue, so every candidate would be refused on click.
+        // It was only ever right because the detail pane hides that picker.
+        let mut p = projection();
+        let top = filed(&mut p, "top");
+        let middle = filed(&mut p, "middle");
+        filed(&mut p, "loner");
+        p.set_parent(middle, Some(top)).unwrap();
+
+        assert!(
+            p.eligible_sub_issues(middle).is_empty(),
+            "a sub-issue cannot take sub-issues"
+        );
+        offers_agree_with_refusals(&p);
+    }
+
+    #[test]
+    fn what_is_offered_is_exactly_what_would_be_accepted() {
+        let mut p = projection();
+        let parent = filed(&mut p, "parent");
+        let child = filed(&mut p, "child");
+        let done = filed(&mut p, "done");
+        let settled = filed(&mut p, "settled");
+        let loner = filed(&mut p, "loner");
+
+        p.set_parent(child, Some(parent)).unwrap();
+        p.patch(done, IssuePatch::default().status(Status::Done))
+            .unwrap();
+        p.patch(settled, IssuePatch::default().status(Status::Cancelled))
+            .unwrap();
+
+        // Every combination, in a corpus holding a parent, a sub-issue, a
+        // Done issue, a Cancelled one and an unattached one.
+        offers_agree_with_refusals(&p);
+
+        // And the individual rules, so a failure above is readable.
+        assert!(!p.eligible_parents(child).iter().any(|i| i.id == child));
+        assert!(
+            !p.eligible_parents(loner).iter().any(|i| i.id == done),
+            "a Done issue cannot take on outstanding work"
+        );
+        assert!(
+            p.eligible_parents(settled).iter().any(|i| i.id == done),
+            "but it can take on work that is already settled"
+        );
+        assert!(
+            !p.eligible_parents(loner).iter().any(|i| i.id == child),
+            "a sub-issue cannot be a parent"
+        );
     }
 
     #[test]
