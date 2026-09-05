@@ -2467,15 +2467,19 @@ name = "gpui-issue-tracker-ui"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "async-channel",
  "chrono",
  "directories",
+ "getrandom 0.3.4",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "gpui_platform",
+ "httparse",
  "rusqlite",
  "rusqlite_migration",
  "rust-embed",
+ "serde",
  "serde_json",
 ]
 

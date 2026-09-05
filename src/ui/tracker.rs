@@ -1,5 +1,10 @@
-//! Root view: owns the Store, the in-memory projection, and all selection
-//! state. The three columns are rendered by sibling modules.
+//! Root view: selection, filters and editing state, rendered from the shared
+//! Projection. The three columns are rendered by sibling modules.
+//!
+//! This view deliberately does *not* own the issues. They live in an
+//! app-level `Entity<Projection>` that outlives the window and that the HTTP
+//! API writes to as well; the view observes it and re-settles itself on every
+//! change, whoever made it. See `docs/adr/0005`.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -13,23 +18,13 @@ use gpui_component::searchable_list::SearchableVec;
 use gpui_component::select::{SelectEvent, SelectState};
 
 use super::theme_catalogue::{ThemeCatalogue, ThemeListDelegate};
-use crate::domain::{
-    Issue, IssueId, Priority, Status, Tag, View, normalise_tags, sort_for_display,
-};
-use crate::store::{Store, settings_keys};
+use crate::domain::{Issue, IssueId, Priority, Status, Tag, View};
+use crate::projection::{IssuePatch, Projection};
+use crate::store::settings_keys;
 
 /// The Tag editor in the detail pane. Tags are plain names, so the delegate is
 /// the library's own `SearchableVec` and no custom one is needed.
 pub(super) type TagCombobox = ComboboxState<SearchableVec<String>>;
-
-/// Every Tag carried by some Issue. This *is* the Tag list — derived Tags have
-/// no registry to consult.
-fn collect_tags(issues: &[Issue]) -> BTreeSet<Tag> {
-    issues
-        .iter()
-        .flat_map(|issue| issue.tags.iter().cloned())
-        .collect()
-}
 
 fn tag_items(in_use: &BTreeSet<Tag>) -> SearchableVec<String> {
     SearchableVec::new(
@@ -79,8 +74,8 @@ pub struct ShowView {
 
 /// Reads a preference, treating a read failure as "unset" — a broken settings
 /// row should cost you a theme, not the app.
-fn read_setting(store: &Store, key: &str) -> Option<String> {
-    match store.get_setting(key) {
+fn read_setting(projection: &Projection, key: &str) -> Option<String> {
+    match projection.setting(key) {
         Ok(value) => value,
         Err(err) => {
             eprintln!("failed to read setting {key}: {err:#}");
@@ -89,8 +84,35 @@ fn read_setting(store: &Store, key: &str) -> Option<String> {
     }
 }
 
+/// Every open window's view, so a pending edit can be flushed before the API
+/// writes. Weak, because a window closing must not be prevented by this list.
+#[derive(Default)]
+struct OpenTrackers(Vec<WeakEntity<IssueTracker>>);
+
+impl Global for OpenTrackers {}
+
+/// Lands every window's debounced edit immediately.
+///
+/// Called before the API applies a write. A pending edit belongs to an earlier
+/// moment than the request now arriving, so it goes first and the API's
+/// change — being later — wins. Without this the debounce would fire *after*
+/// the API write and silently undo it.
+pub fn flush_pending_edits(cx: &mut App) {
+    let open = cx.default_global::<OpenTrackers>().0.clone();
+    let mut live = Vec::with_capacity(open.len());
+    for weak in open {
+        if let Some(tracker) = weak.upgrade() {
+            tracker.update(cx, |this, cx| this.flush_pending_save(cx));
+            live.push(weak);
+        }
+    }
+    // Closed windows are dropped here rather than accumulating forever.
+    cx.default_global::<OpenTrackers>().0 = live;
+}
+
 /// Registers key bindings. Called once at startup.
 pub fn init(cx: &mut App) {
+    cx.default_global::<OpenTrackers>();
     cx.bind_keys([
         KeyBinding::new("j", SelectNext, Some(LIST_CONTEXT)),
         KeyBinding::new("down", SelectNext, Some(LIST_CONTEXT)),
@@ -114,9 +136,8 @@ pub fn init(cx: &mut App) {
 }
 
 pub struct IssueTracker {
-    store: Store,
-    /// Every Issue, display-sorted. The render path reads only from here.
-    issues: Vec<Issue>,
+    /// The shared issue store. Not owned — see the module docs.
+    projection: Entity<Projection>,
     view: View,
     selected: Option<IssueId>,
     /// Substring filter over titles, driven by the list header input.
@@ -156,14 +177,40 @@ pub struct IssueTracker {
 }
 
 impl IssueTracker {
-    pub fn new(store: Store, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut issues = store.load_all().unwrap_or_else(|err| {
-            eprintln!("failed to load issues: {err:#}");
-            Vec::new()
-        });
-        sort_for_display(&mut issues);
-        // Resolved properly once the restored View and filter are known.
-        let selected: Option<IssueId> = None;
+    pub fn new(
+        projection: Entity<Projection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Settings and Tag vocabulary are read up front, in a single borrow,
+        // so it has ended before any entity is constructed below.
+        let stored = {
+            let p = projection.read(cx);
+            RestoredState {
+                light: read_setting(p, settings_keys::THEME_LIGHT),
+                dark: read_setting(p, settings_keys::THEME_DARK),
+                // Anything other than "true" — absent or malformed included —
+                // means visible, which is the safer state to land on.
+                sidebar_hidden: read_setting(p, settings_keys::SIDEBAR_HIDDEN)
+                    .is_some_and(|value| value == "true"),
+                // Working state from the last session. Anything unparseable is
+                // treated as absent rather than fatal.
+                view: read_setting(p, settings_keys::UI_VIEW)
+                    .and_then(|value| value.parse::<View>().ok())
+                    .unwrap_or_default(),
+                filter: read_setting(p, settings_keys::UI_FILTER).unwrap_or_default(),
+                tag: read_setting(p, settings_keys::UI_TAG)
+                    .and_then(|value| value.parse::<Tag>().ok()),
+                selection: read_setting(p, settings_keys::UI_SELECTED)
+                    .and_then(|value| value.parse::<IssueId>().ok()),
+                in_use: p.tags_in_use(),
+            }
+        };
+
+        // A stored Tag that nothing carries any more is dropped rather than
+        // restored: it would filter the list down to nothing, and the sidebar
+        // row you would clear it from no longer exists.
+        let tag_filter = stored.tag.filter(|tag| stored.in_use.contains(tag));
 
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue title"));
         let body_input = cx.new(|cx| {
@@ -171,37 +218,17 @@ impl IssueTracker {
                 .auto_grow(8, 40)
                 .placeholder("Describe the work…")
         });
+
         // Themes: resolve the persisted choices, falling back to the built-in
         // defaults so a first run looks exactly as it did before this feature.
         let catalogue = ThemeCatalogue::load();
-        let stored_light = read_setting(&store, settings_keys::THEME_LIGHT);
-        let stored_dark = read_setting(&store, settings_keys::THEME_DARK);
-        // Anything other than "true" — absent or malformed included — means
-        // visible, which is the safer state to land on.
-        let sidebar_hidden = read_setting(&store, settings_keys::SIDEBAR_HIDDEN)
-            .is_some_and(|value| value == "true");
-
-        // Working state from the last session. Anything unparseable is
-        // treated as absent rather than fatal.
-        let view = read_setting(&store, settings_keys::UI_VIEW)
-            .and_then(|value| value.parse::<View>().ok())
-            .unwrap_or_default();
-        let filter = read_setting(&store, settings_keys::UI_FILTER).unwrap_or_default();
-        // A stored Tag that nothing carries any more is dropped rather than
-        // restored: it would filter the list down to nothing, and the sidebar
-        // row you would clear it from no longer exists.
-        let in_use = collect_tags(&issues);
-        let tag_filter = read_setting(&store, settings_keys::UI_TAG)
-            .and_then(|value| value.parse::<Tag>().ok())
-            .filter(|tag| in_use.contains(tag));
-        let restored_selection = read_setting(&store, settings_keys::UI_SELECTED)
-            .and_then(|value| value.parse::<IssueId>().ok());
-
-        let light_config = stored_light
+        let light_config = stored
+            .light
             .as_deref()
             .and_then(|name| catalogue.find(ThemeMode::Light, name))
             .map(|choice| choice.config.clone());
-        let dark_config = stored_dark
+        let dark_config = stored
+            .dark
             .as_deref()
             .and_then(|name| catalogue.find(ThemeMode::Dark, name))
             .map(|choice| choice.config.clone());
@@ -212,10 +239,12 @@ impl IssueTracker {
 
         let light_delegate = ThemeListDelegate::new(catalogue.for_mode(ThemeMode::Light).to_vec());
         let dark_delegate = ThemeListDelegate::new(catalogue.for_mode(ThemeMode::Dark).to_vec());
-        let light_index = stored_light
+        let light_index = stored
+            .light
             .as_deref()
             .and_then(|name| light_delegate.index_of(name));
-        let dark_index = stored_dark
+        let dark_index = stored
+            .dark
             .as_deref()
             .and_then(|name| dark_delegate.index_of(name));
 
@@ -223,7 +252,7 @@ impl IssueTracker {
         let dark_select = cx.new(|cx| SelectState::new(dark_delegate, dark_index, window, cx));
 
         let tag_select = cx.new(|cx| {
-            ComboboxState::new(tag_items(&in_use), Vec::new(), window, cx)
+            ComboboxState::new(tag_items(&stored.in_use), Vec::new(), window, cx)
                 .multiple(true)
                 .searchable(true)
         });
@@ -233,6 +262,11 @@ impl IssueTracker {
             cx.new(|cx| InputState::new(window, cx).placeholder("New issue title…"));
 
         let subscriptions = vec![
+            // Every change to the shared store lands here, whether this window
+            // made it or the HTTP API did.
+            cx.observe_in(&projection, window, |this, _, window, cx| {
+                this.on_projection_changed(window, cx);
+            }),
             cx.subscribe_in(
                 &title_input,
                 window,
@@ -250,10 +284,11 @@ impl IssueTracker {
             cx.subscribe_in(
                 &filter_input,
                 window,
-                |this, input, event: &InputEvent, _, cx| {
+                |this, input, event: &InputEvent, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         this.filter = input.read(cx).value().to_string();
-                        this.ensure_selection_visible();
+                        this.ensure_selection_visible(cx);
+                        this.refresh_inputs(true, window, cx);
                         this.schedule_ui_state_save(cx);
                         cx.notify();
                     }
@@ -311,23 +346,23 @@ impl IssueTracker {
                 {
                     this.write_edits(id, cx);
                 }
-                this.write_ui_state();
+                this.write_ui_state(cx);
             }),
         ];
 
         let mut this = Self {
-            store,
-            issues,
-            view,
-            selected,
-            filter,
+            projection,
+            view: stored.view,
+            // Resolved properly once the restored View and filter are known.
+            selected: None,
+            filter: stored.filter,
             tag_filter,
             title_input,
             body_input,
             filter_input,
             new_issue_input,
             creating: false,
-            sidebar_hidden,
+            sidebar_hidden: stored.sidebar_hidden,
             list_focus: cx.focus_handle(),
             save_task: None,
             ui_state_task: None,
@@ -340,8 +375,9 @@ impl IssueTracker {
         // Prefer the issue we were last on, but only if it still exists and
         // is visible under the restored View and filter — it may have been
         // deleted, or filtered out, since the window closed.
-        let visible: Vec<IssueId> = this.visible_issues().iter().map(|i| i.id).collect();
-        this.selected = restored_selection
+        let visible: Vec<IssueId> = this.visible_issues(cx).iter().map(|i| i.id).collect();
+        this.selected = stored
+            .selection
             .filter(|id| visible.contains(id))
             .or_else(|| visible.first().copied());
 
@@ -354,24 +390,31 @@ impl IssueTracker {
                 .update(cx, |input, cx| input.set_value(filter, window, cx));
         }
 
-        this.load_selected_into_inputs(window, cx);
+        this.refresh_inputs(true, window, cx);
         // Without this the window opens with nothing focused, so the list
         // bindings (j/k/c/e/x) are dead until something is clicked.
         this.list_focus.focus(window, cx);
+
+        let weak = cx.weak_entity();
+        cx.default_global::<OpenTrackers>().0.push(weak);
         this
     }
 
     // ---- projection queries -------------------------------------------------
 
     /// Issues in the active View matching the filter, in display order.
-    pub(super) fn visible_issues(&self) -> Vec<&Issue> {
+    pub(super) fn visible_issues<'a>(&self, cx: &'a App) -> Vec<&'a Issue> {
         let needle = self.filter.trim().to_lowercase();
-        self.issues
+        let view = self.view;
+        let tag_filter = self.tag_filter.clone();
+        self.projection
+            .read(cx)
+            .issues()
             .iter()
-            .filter(|issue| self.view.contains(issue))
+            .filter(move |issue| view.contains(issue))
             .filter(|issue| needle.is_empty() || issue.title.to_lowercase().contains(&needle))
-            .filter(|issue| {
-                self.tag_filter
+            .filter(move |issue| {
+                tag_filter
                     .as_ref()
                     .is_none_or(|tag| issue.tags.contains(tag))
             })
@@ -379,8 +422,8 @@ impl IssueTracker {
     }
 
     /// Every Tag carried by some Issue, sorted, first-spelling-wins.
-    pub(super) fn tags_in_use(&self) -> BTreeSet<Tag> {
-        collect_tags(&self.issues)
+    pub(super) fn tags_in_use(&self, cx: &App) -> BTreeSet<Tag> {
+        self.projection.read(cx).tags_in_use()
     }
 
     pub(super) fn active_tag(&self) -> Option<&Tag> {
@@ -389,11 +432,8 @@ impl IssueTracker {
 
     /// How many Issues carry a Tag, ignoring the View and the filter — the
     /// Tag equivalent of [`Self::count_for`].
-    pub(super) fn count_for_tag(&self, tag: &Tag) -> usize {
-        self.issues
-            .iter()
-            .filter(|issue| issue.tags.contains(tag))
-            .count()
+    pub(super) fn count_for_tag(&self, tag: &Tag, cx: &App) -> usize {
+        self.projection.read(cx).count_with_tag(tag)
     }
 
     pub(super) fn active_view(&self) -> View {
@@ -404,25 +444,97 @@ impl IssueTracker {
         self.selected
     }
 
-    pub(super) fn selected_issue(&self) -> Option<&Issue> {
-        let id = self.selected?;
-        self.issues.iter().find(|issue| issue.id == id)
+    pub(super) fn selected_issue<'a>(&self, cx: &'a App) -> Option<&'a Issue> {
+        self.projection.read(cx).get(self.selected?)
     }
 
     /// How many Issues a View would show, ignoring the filter.
-    pub(super) fn count_for(&self, view: View) -> usize {
-        self.issues
+    pub(super) fn count_for(&self, view: View, cx: &App) -> usize {
+        self.projection
+            .read(cx)
+            .issues()
             .iter()
             .filter(|issue| view.contains(issue))
             .count()
+    }
+
+    // ---- reacting to the shared store ---------------------------------------
+
+    /// Re-settles this window after *any* change to the shared Projection.
+    ///
+    /// UI-initiated and API-initiated writes both arrive here, which is what
+    /// keeps them consistent: there is no separate "and the API also needs
+    /// to…" path to forget about.
+    fn on_projection_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_selected = self.selected;
+        self.prune_tag_filter(cx);
+        self.ensure_selection_visible(cx);
+        let selection_moved = was_selected != self.selected;
+        self.refresh_inputs(selection_moved, window, cx);
+        self.sync_tag_select(window, cx);
+        cx.notify();
+    }
+
+    /// Mirrors the selected Issue into the inputs. `set_value` deliberately
+    /// suppresses change events, so this never triggers an auto-save.
+    ///
+    /// A *focused* input is left alone unless `force` — meaning the selection
+    /// itself moved. An external write landing mid-sentence must not eat the
+    /// characters under the cursor; an unfocused input, by contrast, is always
+    /// refreshed, because stale text there would be written straight back over
+    /// that same change on the next keystroke.
+    fn refresh_inputs(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (title, body) = match self.selected_issue(cx) {
+            Some(issue) => (issue.title.clone(), issue.body.clone()),
+            None => (String::new(), String::new()),
+        };
+
+        let title_focused = self
+            .title_input
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
+        let body_focused = self.body_input.read(cx).focus_handle(cx).is_focused(window);
+
+        if force || !title_focused {
+            self.title_input
+                .update(cx, |input, cx| input.set_value(title, window, cx));
+        }
+        if force || !body_focused {
+            self.body_input
+                .update(cx, |input, cx| input.set_value(body, window, cx));
+        }
+    }
+
+    /// Applies a change to the shared Projection and notifies its observers.
+    ///
+    /// That notification is what drives [`Self::on_projection_changed`], so a
+    /// write made here re-settles the view by exactly the path an API write
+    /// takes.
+    fn write<T>(
+        &self,
+        cx: &mut App,
+        change: impl FnOnce(&mut Projection) -> anyhow::Result<T>,
+    ) -> Option<T> {
+        self.projection
+            .update(cx, |projection, cx| match change(projection) {
+                Ok(value) => {
+                    cx.notify();
+                    Some(value)
+                }
+                Err(err) => {
+                    eprintln!("failed to write to the issue store: {err:#}");
+                    None
+                }
+            })
     }
 
     // ---- selection ----------------------------------------------------------
 
     pub(super) fn select_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
         self.view = view;
-        self.ensure_selection_visible();
-        self.load_selected_into_inputs(window, cx);
+        self.ensure_selection_visible(cx);
+        self.refresh_inputs(true, window, cx);
         self.schedule_ui_state_save(cx);
         // The View menu carries a checkmark, so the tree has to be rebuilt
         // for it to follow the active View.
@@ -443,7 +555,7 @@ impl IssueTracker {
         // rather than letting it land on the newly selected one.
         self.flush_pending_save(cx);
         self.selected = Some(id);
-        self.load_selected_into_inputs(window, cx);
+        self.refresh_inputs(true, window, cx);
         self.schedule_ui_state_save(cx);
         cx.notify();
     }
@@ -460,8 +572,8 @@ impl IssueTracker {
         } else {
             Some(tag)
         };
-        self.ensure_selection_visible();
-        self.load_selected_into_inputs(window, cx);
+        self.ensure_selection_visible(cx);
+        self.refresh_inputs(true, window, cx);
         self.schedule_ui_state_save(cx);
         cx.notify();
     }
@@ -471,17 +583,22 @@ impl IssueTracker {
     /// A derived Tag vanishes the moment the last Issue lets go of it. A
     /// filter still pointing at one would show an empty list with no way back,
     /// because the sidebar row you would click to clear it is gone too.
-    fn prune_tag_filter(&mut self) {
+    fn prune_tag_filter(&mut self, cx: &App) {
         if let Some(tag) = &self.tag_filter
-            && !self.issues.iter().any(|issue| issue.tags.contains(tag))
+            && !self
+                .projection
+                .read(cx)
+                .issues()
+                .iter()
+                .any(|issue| issue.tags.contains(tag))
         {
             self.tag_filter = None;
         }
     }
 
     /// Keeps the selection inside the visible set after a View or filter change.
-    fn ensure_selection_visible(&mut self) {
-        let visible: Vec<IssueId> = self.visible_issues().iter().map(|i| i.id).collect();
+    fn ensure_selection_visible(&mut self, cx: &App) {
+        let visible: Vec<IssueId> = self.visible_issues(cx).iter().map(|i| i.id).collect();
         if self.selected.is_some_and(|id| visible.contains(&id)) {
             return;
         }
@@ -489,7 +606,7 @@ impl IssueTracker {
     }
 
     fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let visible: Vec<IssueId> = self.visible_issues().iter().map(|i| i.id).collect();
+        let visible: Vec<IssueId> = self.visible_issues(cx).iter().map(|i| i.id).collect();
         if visible.is_empty() {
             return;
         }
@@ -505,20 +622,6 @@ impl IssueTracker {
 
     // ---- editing ------------------------------------------------------------
 
-    /// Mirrors the selected Issue into the inputs. `set_value` deliberately
-    /// suppresses change events, so this never triggers an auto-save.
-    fn load_selected_into_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (title, body) = match self.selected_issue() {
-            Some(issue) => (issue.title.clone(), issue.body.clone()),
-            None => (String::new(), String::new()),
-        };
-        self.title_input
-            .update(cx, |input, cx| input.set_value(title, window, cx));
-        self.body_input
-            .update(cx, |input, cx| input.set_value(body, window, cx));
-        self.sync_tag_select(window, cx);
-    }
-
     /// Restarts the debounce window. The previous task is dropped, cancelling
     /// the save it was waiting to perform.
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
@@ -530,7 +633,10 @@ impl IssueTracker {
     }
 
     /// Saves immediately, abandoning any pending debounce.
-    fn flush_pending_save(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Also runs before the API applies a write, so a half-typed title reaches
+    /// the store before anything else touches that Issue.
+    pub(super) fn flush_pending_save(&mut self, cx: &mut Context<Self>) {
         if self.save_task.take().is_some()
             && let Some(id) = self.selected
         {
@@ -539,34 +645,19 @@ impl IssueTracker {
         }
     }
 
-    /// Writes the inputs through to SQLite, then updates the projection.
+    /// Writes the title and body inputs through to the shared store.
     ///
     /// Takes `&mut App` rather than `Context<Self>` so it can also run from
     /// `on_release`, where the entity is being torn down and no `Context`
-    /// exists. Callers that are still live should `cx.notify()` afterwards.
+    /// exists. Only these two fields are named, so this can never clobber a
+    /// Status or a Tag that something else set in the meantime.
     fn write_edits(&mut self, id: IssueId, cx: &mut App) {
         self.save_task = None;
         let title = self.title_input.read(cx).value().to_string();
         let body = self.body_input.read(cx).value().to_string();
-
-        let Some(issue) = self.issues.iter_mut().find(|issue| issue.id == id) else {
-            return;
-        };
-        if issue.title == title && issue.body == body {
-            return;
-        }
-        issue.title = title;
-        issue.body = body;
-
-        let snapshot = issue.clone();
-        match self.store.update(&snapshot) {
-            Ok(updated_at) => {
-                if let Some(issue) = self.issues.iter_mut().find(|issue| issue.id == id) {
-                    issue.updated_at = updated_at;
-                }
-            }
-            Err(err) => eprintln!("failed to save issue #{id}: {err:#}"),
-        }
+        self.write(cx, |projection| {
+            projection.patch(id, IssuePatch::default().title(title).body(body))
+        });
     }
 
     pub(super) fn set_status(
@@ -575,7 +666,7 @@ impl IssueTracker {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.mutate_selected(cx, |issue| issue.status = status);
+        self.patch_selected(IssuePatch::default().status(status), cx);
     }
 
     pub(super) fn set_priority(
@@ -584,27 +675,17 @@ impl IssueTracker {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.mutate_selected(cx, |issue| issue.priority = priority);
+        self.patch_selected(IssuePatch::default().priority(priority), cx);
     }
 
-    /// Writes a Tag set onto the selected Issue.
+    /// Applies a patch to the selected Issue.
     ///
-    /// Routed through [`Self::mutate_selected`], so tagging stamps
-    /// `updated_at` and re-sorts exactly as a Status or Priority change does:
-    /// tagging is an edit, not a free annotation.
-    fn set_tags(&mut self, tags: Vec<Tag>, cx: &mut Context<Self>) {
-        let in_use = self.tags_in_use();
-        let tags = normalise_tags(tags, &in_use);
-        // Tag equality is case-insensitive, so this also catches a `bug` that
-        // folded into an existing `Bug` and would otherwise bump `updated_at`
-        // for no visible change.
-        if self
-            .selected_issue()
-            .is_some_and(|issue| issue.tags == tags)
-        {
-            return;
-        }
-        self.mutate_selected(cx, |issue| issue.tags = tags);
+    /// Tagging goes through here like everything else, so it stamps
+    /// `updated_at` and re-sorts exactly as a Status change does: tagging is
+    /// an edit, not a free annotation.
+    fn patch_selected(&mut self, patch: IssuePatch, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else { return };
+        self.write(cx, |projection| projection.patch(id, patch));
     }
 
     /// Applies whatever the Combobox now reports as selected.
@@ -613,7 +694,7 @@ impl IssueTracker {
             .iter()
             .filter_map(|value| value.parse().ok())
             .collect();
-        self.set_tags(tags, cx);
+        self.patch_selected(IssuePatch::default().tags(tags), cx);
     }
 
     /// Adds the Tag currently typed into the Combobox's search box.
@@ -626,42 +707,27 @@ impl IssueTracker {
         let Ok(tag) = query.parse::<Tag>() else {
             return;
         };
-        let Some(issue) = self.selected_issue() else {
-            return;
-        };
-        let mut tags = issue.tags.clone();
-        if !tags.contains(&tag) {
-            tags.push(tag);
-        }
-        self.set_tags(tags, cx);
+        let Some(id) = self.selected else { return };
+        self.write(cx, |projection| projection.add_tag(id, tag));
         self.sync_tag_select(window, cx);
     }
 
     /// Takes one Tag off the selected Issue, from its chip's remove button.
     pub(super) fn remove_tag(&mut self, tag: Tag, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(issue) = self.selected_issue() else {
-            return;
-        };
-        let tags = issue
-            .tags
-            .iter()
-            .filter(|candidate| **candidate != tag)
-            .cloned()
-            .collect();
-        self.set_tags(tags, cx);
+        let Some(id) = self.selected else { return };
+        self.write(cx, |projection| projection.remove_tag(id, &tag));
         self.sync_tag_select(window, cx);
     }
 
     /// Points the Combobox at the current Tag vocabulary and the selected
     /// Issue's Tags.
     ///
-    /// Called when the selected Issue changes — never on every write.
-    /// `set_selected_values` clears the search query as a side effect, which
-    /// would yank the text out from under someone mid-type.
+    /// `set_selected_values` clears the search query as a side effect, so this
+    /// runs on settle rather than on every keystroke.
     fn sync_tag_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let items = tag_items(&self.tags_in_use());
+        let items = tag_items(&self.tags_in_use(cx));
         let selected: Vec<String> = self
-            .selected_issue()
+            .selected_issue(cx)
             .map(|issue| {
                 issue
                     .tags
@@ -674,30 +740,6 @@ impl IssueTracker {
             state.set_items(items, window, cx);
             state.set_selected_values(&selected, window, cx);
         });
-    }
-
-    /// Applies a change to the selected Issue and writes it through.
-    fn mutate_selected(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut Issue)) {
-        let Some(id) = self.selected else { return };
-        let Some(issue) = self.issues.iter_mut().find(|issue| issue.id == id) else {
-            return;
-        };
-        change(issue);
-        let snapshot = issue.clone();
-        match self.store.update(&snapshot) {
-            Ok(updated_at) => {
-                if let Some(issue) = self.issues.iter_mut().find(|issue| issue.id == id) {
-                    issue.updated_at = updated_at;
-                }
-            }
-            Err(err) => eprintln!("failed to save issue #{id}: {err:#}"),
-        }
-        sort_for_display(&mut self.issues);
-        // A status change can move the Issue out of the active View, and
-        // dropping the last use of a Tag can empty the Tag filter.
-        self.prune_tag_filter();
-        self.ensure_selection_visible();
-        cx.notify();
     }
 
     // ---- create -------------------------------------------------------------
@@ -717,18 +759,14 @@ impl IssueTracker {
             self.cancel_creating(window, cx);
             return;
         }
-        match self.store.insert(&title) {
-            Ok(issue) => {
-                let id = issue.id;
-                self.issues.push(issue);
-                sort_for_display(&mut self.issues);
-                self.selected = Some(id);
-                // Stay in create mode so several issues can be typed in a row.
-                self.new_issue_input
-                    .update(cx, |input, cx| input.set_value("", window, cx));
-                self.load_selected_into_inputs(window, cx);
-            }
-            Err(err) => eprintln!("failed to create issue: {err:#}"),
+        if let Some(issue) = self.write(cx, |projection| {
+            projection.create(&title, IssuePatch::default())
+        }) {
+            self.selected = Some(issue.id);
+            // Stay in create mode so several issues can be typed in a row.
+            self.new_issue_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            self.refresh_inputs(true, window, cx);
         }
         cx.notify();
     }
@@ -750,13 +788,13 @@ impl IssueTracker {
     fn schedule_ui_state_save(&mut self, cx: &mut Context<Self>) {
         self.ui_state_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SAVE_DEBOUNCE).await;
-            this.update(cx, |this, _| this.write_ui_state()).ok();
+            this.update(cx, |this, cx| this.write_ui_state(cx)).ok();
         }));
     }
 
     /// Writes working state immediately. Failures are logged, never fatal —
     /// losing your place is not worth interrupting anyone over.
-    fn write_ui_state(&mut self) {
+    fn write_ui_state(&mut self, cx: &App) {
         self.ui_state_task = None;
 
         let selected = self.selected.map(|id| id.to_string()).unwrap_or_default();
@@ -773,7 +811,7 @@ impl IssueTracker {
         ];
 
         for (key, value) in values {
-            if let Err(err) = self.store.set_setting(key, &value) {
+            if let Err(err) = self.projection.read(cx).set_setting(key, &value) {
                 eprintln!("failed to save {key}: {err:#}");
             }
         }
@@ -787,7 +825,7 @@ impl IssueTracker {
     pub(super) fn flush_pending_writes(&mut self, cx: &mut Context<Self>) {
         self.flush_pending_save(cx);
         if self.ui_state_task.is_some() {
-            self.write_ui_state();
+            self.write_ui_state(cx);
         }
     }
 
@@ -804,7 +842,11 @@ impl IssueTracker {
         cx.notify();
 
         let value = if self.sidebar_hidden { "true" } else { "false" };
-        if let Err(err) = self.store.set_setting(settings_keys::SIDEBAR_HIDDEN, value) {
+        if let Err(err) = self
+            .projection
+            .read(cx)
+            .set_setting(settings_keys::SIDEBAR_HIDDEN, value)
+        {
             eprintln!("failed to save sidebar visibility: {err:#}");
         }
     }
@@ -876,7 +918,7 @@ impl IssueTracker {
             ThemeMode::Light => settings_keys::THEME_LIGHT,
             ThemeMode::Dark => settings_keys::THEME_DARK,
         };
-        if let Err(err) = self.store.set_setting(key, name) {
+        if let Err(err) = self.projection.read(cx).set_setting(key, name) {
             eprintln!("failed to save {key}: {err:#}");
             return;
         }
@@ -892,26 +934,19 @@ impl IssueTracker {
 
     /// Erases an Issue. Guarded by a confirmation dialog at the call site —
     /// cancelling an Issue is a Status change, this is for mistakes.
+    ///
+    /// Selection and Tag filter are re-settled by
+    /// [`Self::on_projection_changed`], exactly as they would be had the API
+    /// done the deleting.
     pub(super) fn delete_issue(
         &mut self,
         id: IssueId,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Don't let a queued auto-save resurrect what we're about to erase.
         self.save_task = None;
-        if let Err(err) = self.store.delete(id) {
-            eprintln!("failed to delete issue #{id}: {err:#}");
-            return;
-        }
-        self.issues.retain(|issue| issue.id != id);
-        self.prune_tag_filter();
-        if self.selected == Some(id) {
-            self.selected = None;
-            self.ensure_selection_visible();
-            self.load_selected_into_inputs(window, cx);
-        }
-        cx.notify();
+        self.write(cx, |projection| projection.delete(id));
     }
 
     // ---- actions ------------------------------------------------------------
@@ -936,11 +971,13 @@ impl IssueTracker {
     }
 
     fn on_delete_issue(&mut self, _: &DeleteIssue, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(issue) = self.selected_issue() {
-            let id = issue.id;
-            let title = issue.display_title().to_string();
-            self.confirm_delete(id, title, window, cx);
-        }
+        let Some((id, title)) = self
+            .selected_issue(cx)
+            .map(|issue| (issue.id, issue.display_title().to_string()))
+        else {
+            return;
+        };
+        self.confirm_delete(id, title, window, cx);
     }
 
     fn on_focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
@@ -970,6 +1007,18 @@ impl IssueTracker {
         self.list_focus.focus(window, cx);
         cx.notify();
     }
+}
+
+/// Everything restored from the `setting` table at startup, read in one borrow.
+struct RestoredState {
+    light: Option<String>,
+    dark: Option<String>,
+    sidebar_hidden: bool,
+    view: View,
+    filter: String,
+    tag: Option<Tag>,
+    selection: Option<IssueId>,
+    in_use: BTreeSet<Tag>,
 }
 
 impl Render for IssueTracker {

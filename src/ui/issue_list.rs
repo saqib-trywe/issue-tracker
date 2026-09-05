@@ -9,7 +9,7 @@ use gpui_component::{ActiveTheme, Side, Sizable};
 
 use super::tag_colour::colour_for;
 use super::tracker::{IssueTracker, LIST_CONTEXT};
-use crate::domain::{Issue, Priority};
+use crate::domain::{Issue, IssueId, Priority, Status, Tag};
 
 impl IssueTracker {
     pub(super) fn render_issue_list(
@@ -18,11 +18,16 @@ impl IssueTracker {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let selected = self.selected_id();
-        let mut rows = Vec::new();
-        for issue in self.visible_issues() {
-            rows.push(Self::render_row(issue, selected == Some(issue.id), cx));
+        // Collected into owned rows first: the Issues are borrowed from the
+        // shared Projection through `cx`, and building elements needs `cx`
+        // mutably. Only what a row displays is cloned — never the body.
+        let visible: Vec<Row> = self.visible_issues(cx).into_iter().map(Row::from).collect();
+        let is_empty = visible.is_empty();
+        let mut rows = Vec::with_capacity(visible.len());
+        for row in visible {
+            let is_selected = selected == Some(row.id);
+            rows.push(Self::render_row(row, is_selected, cx));
         }
-        let is_empty = rows.is_empty();
 
         div()
             // Focusable, so navigation bindings apply only when the list has
@@ -100,16 +105,14 @@ impl IssueTracker {
             .child(Input::new(&self.new_issue_input).small())
     }
 
-    fn render_row(
-        issue: &Issue,
-        is_selected: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let id = issue.id;
-        let title = issue.display_title().to_string();
-        let status = issue.status;
-        let priority = issue.priority;
-        let tags = issue.tags.clone();
+    fn render_row(row: Row, is_selected: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let Row {
+            id,
+            title,
+            status,
+            priority,
+            tags,
+        } = row;
 
         div()
             .id(SharedString::from(format!("issue-{id}")))
@@ -173,5 +176,29 @@ impl IssueTracker {
                             .child(tag.as_str().to_owned())
                     })),
             )
+    }
+}
+
+/// One list row's worth of an Issue.
+///
+/// Exists so the borrow of the shared Projection can end before the element
+/// tree is built, and so a row never clones an Issue body it does not show.
+struct Row {
+    id: IssueId,
+    title: String,
+    status: Status,
+    priority: Priority,
+    tags: Vec<Tag>,
+}
+
+impl From<&Issue> for Row {
+    fn from(issue: &Issue) -> Self {
+        Self {
+            id: issue.id,
+            title: issue.display_title().to_string(),
+            status: issue.status,
+            priority: issue.priority,
+            tags: issue.tags.clone(),
+        }
     }
 }

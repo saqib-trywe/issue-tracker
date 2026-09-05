@@ -21,4 +21,11 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 rusqlite_migration = "2.6.0"
 directories = "6.0.0"
 chrono = "0.4.45"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
+# A local HTTP API, served on a blocking listener thread. `httparse` is the
+# same parser Zed uses for its own in-process HTTP server; nothing here needs
+# an async runtime. See docs/adr/0006.
+httparse = "1"
+getrandom = "0.3"
+async-channel = "2"

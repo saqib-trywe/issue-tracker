@@ -22,7 +22,7 @@ impl IssueTracker {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(issue) = self.selected_issue() else {
+        let Some(issue) = self.selected_issue(cx) else {
             return div()
                 .flex_1()
                 .h_full()

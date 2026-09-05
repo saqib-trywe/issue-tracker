@@ -16,7 +16,7 @@ impl IssueTracker {
         let active = self.active_view();
         let counts: Vec<(View, usize)> = View::ALL
             .into_iter()
-            .map(|view| (view, self.count_for(view)))
+            .map(|view| (view, self.count_for(view, cx)))
             .collect();
 
         div()
@@ -58,7 +58,7 @@ impl IssueTracker {
     /// only unbounded part of the sidebar, so it is the part that scrolls;
     /// Views stay at the top and Appearance stays pinned to the bottom.
     fn render_tags(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let tags = self.tags_in_use();
+        let tags = self.tags_in_use(cx);
         if tags.is_empty() {
             return None;
         }
@@ -66,7 +66,7 @@ impl IssueTracker {
         let active = self.active_tag().cloned();
         let mut rows = Vec::with_capacity(tags.len());
         for tag in &tags {
-            let count = self.count_for_tag(tag);
+            let count = self.count_for_tag(tag, cx);
             let is_active = active.as_ref() == Some(tag);
             rows.push(Self::render_tag_row(tag.clone(), count, is_active, cx));
         }

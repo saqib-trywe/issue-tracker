@@ -1,8 +1,13 @@
 # Issue Tracking
 
-A single-user desktop issue tracker that owns its own data. There is no sync,
-no network, and no second user — several conventions common to issue trackers
-carry no information here and are deliberately absent.
+A single-user desktop issue tracker that owns its own data. There is no sync
+and no second user — several conventions common to issue trackers carry no
+information here and are deliberately absent.
+
+The tracker can be driven from outside the window as well as through it, by
+scripts acting on your behalf. That is still one user: the two are alternative
+ways into the same person's issues, not two participants, and nothing in the
+language below exists to tell them apart.
 
 ## Language
 

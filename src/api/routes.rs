@@ -1,0 +1,515 @@
+//! Endpoint matching and the handlers behind it.
+//!
+//! Routing is written out by hand rather than delegated to a framework,
+//! because one route needs matching a framework would fight: a Tag name is the
+//! whole remainder of the path, slashes included, so `/issues/3/tags/ui/theme`
+//! addresses the Tag `ui/theme` rather than being four segments.
+
+use serde::de::DeserializeOwned;
+
+use super::http::{Request, Response};
+use super::wire::{IssueJson, NewIssue, PatchIssue, TagJson};
+use crate::domain::{IssueId, Status, Tag};
+use crate::projection::Projection;
+
+enum Route {
+    Issues,
+    Issue(IssueId),
+    IssueTag(IssueId, String),
+    Tags,
+}
+
+fn route(path: &str) -> Option<Route> {
+    match path {
+        "/issues" => return Some(Route::Issues),
+        "/tags" => return Some(Route::Tags),
+        _ => {}
+    }
+
+    let rest = path.strip_prefix("/issues/")?;
+    let (id, tail) = match rest.find('/') {
+        Some(cut) => (&rest[..cut], &rest[cut..]),
+        None => (rest, ""),
+    };
+    let id: IssueId = id.parse().ok()?;
+
+    if tail.is_empty() {
+        return Some(Route::Issue(id));
+    }
+    // Everything after `/tags/` is the name, however many slashes it holds.
+    let name = tail.strip_prefix("/tags/")?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(Route::IssueTag(id, name.to_string()))
+}
+
+pub fn dispatch(request: &Request, projection: &mut Projection) -> Response {
+    let Some(route) = route(&request.path) else {
+        return Response::error(404, format!("no such endpoint: {}", request.path));
+    };
+
+    match (route, request.method.as_str()) {
+        (Route::Issues, "GET") => list_issues(request, projection),
+        (Route::Issues, "POST") => create_issue(request, projection),
+        (Route::Issues, _) => method_not_allowed("GET, POST"),
+
+        (Route::Issue(id), "GET") => match projection.get(id) {
+            Some(issue) => Response::json(200, &IssueJson::from(issue)),
+            None => not_found(id),
+        },
+        (Route::Issue(id), "PATCH") => patch_issue(id, request, projection),
+        (Route::Issue(id), "DELETE") => match projection.delete(id) {
+            Ok(true) => Response::empty(204),
+            Ok(false) => not_found(id),
+            Err(err) => Response::error(500, err),
+        },
+        (Route::Issue(_), _) => method_not_allowed("GET, PATCH, DELETE"),
+
+        (Route::IssueTag(id, name), "PUT") => change_tag(id, &name, projection, true),
+        (Route::IssueTag(id, name), "DELETE") => change_tag(id, &name, projection, false),
+        (Route::IssueTag(..), _) => method_not_allowed("PUT, DELETE"),
+
+        (Route::Tags, "GET") => list_tags(projection),
+        (Route::Tags, _) => method_not_allowed("GET"),
+    }
+}
+
+// ---- handlers ---------------------------------------------------------------
+
+/// `GET /issues`, with the same three narrowings the UI offers: a Status
+/// slice, a Tag filter, and a title substring.
+fn list_issues(request: &Request, projection: &Projection) -> Response {
+    let status = match request.param("status").map(str::parse::<Status>) {
+        Some(Ok(status)) => Some(status),
+        Some(Err(err)) => return Response::error(400, err),
+        None => None,
+    };
+    let tag = match request.param("tag").map(str::parse::<Tag>) {
+        Some(Ok(tag)) => Some(tag),
+        Some(Err(err)) => return Response::error(400, err),
+        None => None,
+    };
+    let needle = request
+        .param("q")
+        .map(|query| query.trim().to_lowercase())
+        .filter(|query| !query.is_empty());
+
+    // `issues()` is already in display order, so the API and the UI agree on
+    // what "first" means.
+    let issues: Vec<IssueJson> = projection
+        .issues()
+        .iter()
+        .filter(|issue| status.is_none_or(|status| issue.status == status))
+        .filter(|issue| tag.as_ref().is_none_or(|tag| issue.tags.contains(tag)))
+        .filter(|issue| {
+            needle
+                .as_ref()
+                .is_none_or(|needle| issue.title.to_lowercase().contains(needle))
+        })
+        .map(IssueJson::from)
+        .collect();
+
+    Response::json(200, &issues)
+}
+
+fn create_issue(request: &Request, projection: &mut Projection) -> Response {
+    let new: NewIssue = match json_body(request) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+
+    let title = new.title.trim().to_string();
+    if title.is_empty() {
+        return Response::error(400, "title must not be blank");
+    }
+    let patch = match new.rest.into_patch() {
+        Ok(patch) => patch,
+        Err(err) => return Response::error(400, err),
+    };
+
+    match projection.create(&title, patch) {
+        Ok(issue) => Response::json(201, &IssueJson::from(&issue))
+            .with_header("Location", format!("/issues/{}", issue.id)),
+        Err(err) => Response::error(500, err),
+    }
+}
+
+fn patch_issue(id: IssueId, request: &Request, projection: &mut Projection) -> Response {
+    let body: PatchIssue = match json_body(request) {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let patch = match body.into_patch() {
+        Ok(patch) => patch,
+        Err(err) => return Response::error(400, err),
+    };
+
+    match projection.patch(id, patch) {
+        Ok(Some(issue)) => Response::json(200, &IssueJson::from(&issue)),
+        Ok(None) => not_found(id),
+        Err(err) => Response::error(500, err),
+    }
+}
+
+/// `PUT`/`DELETE /issues/{id}/tags/{name}`.
+///
+/// Both are idempotent and both go through the single writer, so neither has
+/// the read-modify-write race that changing one Tag through `PATCH` would.
+fn change_tag(id: IssueId, name: &str, projection: &mut Projection, add: bool) -> Response {
+    let tag: Tag = match name.parse() {
+        Ok(tag) => tag,
+        Err(err) => return Response::error(400, err),
+    };
+
+    let outcome = if add {
+        projection.add_tag(id, tag)
+    } else {
+        projection.remove_tag(id, &tag)
+    };
+
+    match outcome {
+        Ok(Some(issue)) => Response::json(200, &IssueJson::from(&issue)),
+        Ok(None) => not_found(id),
+        Err(err) => Response::error(500, err),
+    }
+}
+
+/// `GET /tags` — the same derived list the sidebar shows, with the same counts.
+fn list_tags(projection: &Projection) -> Response {
+    let tags: Vec<TagJson> = projection
+        .tags_in_use()
+        .iter()
+        .map(|tag| TagJson {
+            name: tag.as_str().to_owned(),
+            count: projection.count_with_tag(tag),
+        })
+        .collect();
+    Response::json(200, &tags)
+}
+
+// ---- helpers ----------------------------------------------------------------
+
+/// An absent body reads as `{}`, so `PATCH` with nothing to say is a no-op
+/// rather than a parse error.
+fn json_body<T: DeserializeOwned>(request: &Request) -> Result<T, Response> {
+    let raw: &[u8] = if request.body.is_empty() {
+        b"{}"
+    } else {
+        &request.body
+    };
+    serde_json::from_slice(raw).map_err(|err| Response::error(400, format!("invalid body: {err}")))
+}
+
+fn not_found(id: IssueId) -> Response {
+    Response::error(404, format!("no issue #{id}"))
+}
+
+fn method_not_allowed(allow: &str) -> Response {
+    Response::error(405, format!("allowed here: {allow}")).with_header("Allow", allow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::http::{Parsed, parse};
+    use super::*;
+    use crate::projection::IssuePatch;
+    use crate::store::Store;
+
+    fn projection() -> Projection {
+        Projection::load(Store::open_in_memory().expect("store")).expect("projection")
+    }
+
+    /// Sends a request, skipping the auth guard (exercised in `auth`).
+    fn send(projection: &mut Projection, method: &str, target: &str, body: &str) -> Response {
+        let raw = if body.is_empty() {
+            format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        } else {
+            format!(
+                "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        match parse(raw.as_bytes()) {
+            Parsed::Complete(request) => dispatch(&request, projection),
+            other => panic!("could not build the request: {other:?}"),
+        }
+    }
+
+    fn json(response: &Response) -> serde_json::Value {
+        serde_json::from_slice(&response.body).expect("a JSON body")
+    }
+
+    #[test]
+    fn an_unknown_path_is_not_found() {
+        let mut p = projection();
+        assert_eq!(send(&mut p, "GET", "/nope", "").status, 404);
+        assert_eq!(send(&mut p, "GET", "/issues/notanumber", "").status, 404);
+    }
+
+    #[test]
+    fn a_wrong_method_says_what_is_allowed() {
+        let mut p = projection();
+        let response = send(&mut p, "DELETE", "/issues", "");
+        assert_eq!(response.status, 405);
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "Allow" && value.contains("POST"))
+        );
+    }
+
+    #[test]
+    fn creating_returns_201_and_where_it_went() {
+        let mut p = projection();
+        let response = send(&mut p, "POST", "/issues", r#"{"title":"filed by script"}"#);
+
+        assert_eq!(response.status, 201);
+        let id = json(&response)["id"].as_i64().unwrap();
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "Location" && value == &format!("/issues/{id}"))
+        );
+        assert_eq!(json(&response)["status"], "Todo");
+    }
+
+    #[test]
+    fn creating_applies_every_field_in_one_call() {
+        let mut p = projection();
+        let response = send(
+            &mut p,
+            "POST",
+            "/issues",
+            r#"{"title":"full","body":"b","status":"Doing","priority":"Urgent","tags":["Bug","ui"]}"#,
+        );
+
+        assert_eq!(response.status, 201);
+        let issue = json(&response);
+        assert_eq!(issue["body"], "b");
+        assert_eq!(issue["status"], "Doing");
+        assert_eq!(issue["priority"], "Urgent");
+        assert_eq!(issue["tags"], serde_json::json!(["Bug", "ui"]));
+    }
+
+    #[test]
+    fn a_blank_title_is_refused() {
+        let mut p = projection();
+        assert_eq!(
+            send(&mut p, "POST", "/issues", r#"{"title":"  "}"#).status,
+            400
+        );
+        assert_eq!(send(&mut p, "POST", "/issues", "{}").status, 400);
+    }
+
+    #[test]
+    fn a_bad_enum_value_is_a_400_naming_the_offender() {
+        let mut p = projection();
+        let response = send(
+            &mut p,
+            "POST",
+            "/issues",
+            r#"{"title":"t","status":"Wontfix"}"#,
+        );
+        assert_eq!(response.status, 400);
+        assert!(
+            json(&response)["error"]
+                .as_str()
+                .unwrap()
+                .contains("Wontfix")
+        );
+    }
+
+    #[test]
+    fn malformed_json_is_a_400_not_a_panic() {
+        let mut p = projection();
+        assert_eq!(send(&mut p, "POST", "/issues", "{not json").status, 400);
+    }
+
+    #[test]
+    fn reading_one_issue_or_failing_to() {
+        let mut p = projection();
+        let created = p.create("readable", IssuePatch::default()).unwrap();
+
+        let found = send(&mut p, "GET", &format!("/issues/{}", created.id), "");
+        assert_eq!(found.status, 200);
+        assert_eq!(json(&found)["title"], "readable");
+
+        assert_eq!(send(&mut p, "GET", "/issues/9999", "").status, 404);
+    }
+
+    #[test]
+    fn a_patch_touches_only_what_it_names() {
+        let mut p = projection();
+        let created = p.create("keep me", IssuePatch::default()).unwrap();
+
+        let response = send(
+            &mut p,
+            "PATCH",
+            &format!("/issues/{}", created.id),
+            r#"{"status":"Done"}"#,
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(json(&response)["status"], "Done");
+        assert_eq!(json(&response)["title"], "keep me");
+    }
+
+    #[test]
+    fn an_empty_patch_body_is_a_no_op_rather_than_an_error() {
+        let mut p = projection();
+        let created = p.create("unchanged", IssuePatch::default()).unwrap();
+        let response = send(&mut p, "PATCH", &format!("/issues/{}", created.id), "");
+        assert_eq!(response.status, 200);
+        assert_eq!(json(&response)["title"], "unchanged");
+    }
+
+    #[test]
+    fn patching_a_missing_issue_is_404() {
+        let mut p = projection();
+        assert_eq!(
+            send(&mut p, "PATCH", "/issues/404", r#"{"title":"ghost"}"#).status,
+            404
+        );
+    }
+
+    #[test]
+    fn deleting_is_204_then_404() {
+        let mut p = projection();
+        let created = p.create("doomed", IssuePatch::default()).unwrap();
+        let path = format!("/issues/{}", created.id);
+
+        let gone = send(&mut p, "DELETE", &path, "");
+        assert_eq!(gone.status, 204);
+        assert!(gone.body.is_empty());
+        assert_eq!(send(&mut p, "DELETE", &path, "").status, 404);
+    }
+
+    #[test]
+    fn listing_is_in_display_order() {
+        let mut p = projection();
+        p.create("low", IssuePatch::default()).unwrap();
+        let urgent = p
+            .create(
+                "urgent",
+                IssuePatch::default().priority(crate::domain::Priority::Urgent),
+            )
+            .unwrap();
+
+        let response = send(&mut p, "GET", "/issues", "");
+        assert_eq!(json(&response)[0]["id"], urgent.id);
+    }
+
+    #[test]
+    fn listing_narrows_by_status_tag_and_title() {
+        let mut p = projection();
+        p.create(
+            "alpha bug",
+            IssuePatch::default()
+                .status(Status::Doing)
+                .tags(vec!["Bug".parse().unwrap()]),
+        )
+        .unwrap();
+        p.create("beta", IssuePatch::default().status(Status::Todo))
+            .unwrap();
+
+        let by_status = send(&mut p, "GET", "/issues?status=Doing", "");
+        assert_eq!(json(&by_status).as_array().unwrap().len(), 1);
+
+        let by_tag = send(&mut p, "GET", "/issues?tag=bug", "");
+        assert_eq!(json(&by_tag).as_array().unwrap().len(), 1, "tags fold case");
+
+        let by_title = send(&mut p, "GET", "/issues?q=BETA", "");
+        assert_eq!(json(&by_title)[0]["title"], "beta");
+
+        let combined = send(&mut p, "GET", "/issues?status=Todo&q=alpha", "");
+        assert!(json(&combined).as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_bad_filter_value_is_a_400() {
+        let mut p = projection();
+        assert_eq!(send(&mut p, "GET", "/issues?status=Nope", "").status, 400);
+    }
+
+    #[test]
+    fn tags_are_added_and_removed_one_at_a_time() {
+        let mut p = projection();
+        let created = p.create("taggable", IssuePatch::default()).unwrap();
+        let base = format!("/issues/{}/tags", created.id);
+
+        let added = send(&mut p, "PUT", &format!("{base}/Bug"), "");
+        assert_eq!(added.status, 200);
+        assert_eq!(json(&added)["tags"], serde_json::json!(["Bug"]));
+
+        // Idempotent, and case-folding: this is the same Tag.
+        let again = send(&mut p, "PUT", &format!("{base}/bug"), "");
+        assert_eq!(json(&again)["tags"], serde_json::json!(["Bug"]));
+
+        let removed = send(&mut p, "DELETE", &format!("{base}/BUG"), "");
+        assert_eq!(json(&removed)["tags"], serde_json::json!([]));
+        // Removing what is already gone still succeeds.
+        assert_eq!(
+            send(&mut p, "DELETE", &format!("{base}/BUG"), "").status,
+            200
+        );
+    }
+
+    #[test]
+    fn a_tag_name_may_contain_slashes_and_spaces() {
+        let mut p = projection();
+        let created = p.create("taggable", IssuePatch::default()).unwrap();
+        let base = format!("/issues/{}/tags", created.id);
+
+        let slashed = send(&mut p, "PUT", &format!("{base}/ui/theme"), "");
+        assert_eq!(json(&slashed)["tags"], serde_json::json!(["ui/theme"]));
+
+        let spaced = send(&mut p, "PUT", &format!("{base}/needs%20design"), "");
+        assert_eq!(
+            json(&spaced)["tags"],
+            serde_json::json!(["needs design", "ui/theme"])
+        );
+    }
+
+    #[test]
+    fn an_unusable_tag_name_is_a_400() {
+        let mut p = projection();
+        let created = p.create("taggable", IssuePatch::default()).unwrap();
+        let response = send(
+            &mut p,
+            "PUT",
+            &format!("/issues/{}/tags/%20", created.id),
+            "",
+        );
+        assert_eq!(response.status, 400);
+    }
+
+    #[test]
+    fn tagging_a_missing_issue_is_404() {
+        let mut p = projection();
+        assert_eq!(send(&mut p, "PUT", "/issues/404/tags/Bug", "").status, 404);
+    }
+
+    #[test]
+    fn the_tag_list_matches_the_sidebar() {
+        let mut p = projection();
+        p.create(
+            "one",
+            IssuePatch::default().tags(vec!["Bug".parse().unwrap()]),
+        )
+        .unwrap();
+        p.create(
+            "two",
+            IssuePatch::default().tags(vec!["bug".parse().unwrap(), "ui".parse().unwrap()]),
+        )
+        .unwrap();
+
+        let response = send(&mut p, "GET", "/tags", "");
+        assert_eq!(
+            json(&response),
+            serde_json::json!([{"name":"Bug","count":2},{"name":"ui","count":1}])
+        );
+    }
+}

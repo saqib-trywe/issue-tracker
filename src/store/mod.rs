@@ -220,6 +220,15 @@ pub fn db_path() -> Result<PathBuf> {
     Ok(dirs.data_dir().join("issues.db"))
 }
 
+/// Where the API publishes its port and token, beside the database so the two
+/// live and die together.
+///
+/// Its presence means the app is running: it is written once the listener is
+/// bound and removed on the way out.
+pub fn api_file_path() -> Result<PathBuf> {
+    Ok(db_path()?.with_file_name("api.json"))
+}
+
 fn format_timestamp(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }

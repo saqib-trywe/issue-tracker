@@ -1,10 +1,14 @@
+mod api;
+mod app_state;
 mod domain;
+mod projection;
 mod store;
 mod ui;
 
 use gpui::*;
 use gpui_component::Root;
 
+use projection::Projection;
 use store::Store;
 use ui::IssueTracker;
 
@@ -14,13 +18,10 @@ use ui::IssueTracker;
 /// app stays alive after its last window closes, and clicking the icon has to
 /// be able to bring one back.
 fn open_main_window(cx: &mut App) {
-    let store = match Store::open() {
-        Ok(store) => store,
-        Err(err) => {
-            eprintln!("failed to open the database: {err:#}");
-            return;
-        }
-    };
+    // The window borrows the shared Projection rather than opening its own
+    // database: the HTTP API writes to the same one, and a second copy would
+    // go stale the moment either wrote.
+    let projection = app_state::projection(cx);
 
     let opened = cx.open_window(
         WindowOptions {
@@ -39,7 +40,7 @@ fn open_main_window(cx: &mut App) {
             // to Light, so a dark-mode machine would otherwise flash white.
             ui::apply_system_appearance(window, cx);
 
-            let view = cx.new(|cx| IssueTracker::new(store, window, cx));
+            let view = cx.new(|cx| IssueTracker::new(projection, window, cx));
             cx.new(|cx| Root::new(view, window, cx))
         },
     );
@@ -67,6 +68,22 @@ fn main() {
         gpui_component::init(cx);
         ui::init(cx);
         ui::menus::rebuild(domain::View::default(), cx);
+
+        // The database *is* the application: with no issues there is nothing
+        // to show and nothing to serve. Failing loudly beats the alternative,
+        // which on macOS is a running process with no window and no
+        // explanation.
+        let projection = match Store::open().and_then(Projection::load) {
+            Ok(projection) => cx.new(|_| projection),
+            Err(err) => {
+                eprintln!("failed to open the issue database: {err:#}");
+                std::process::exit(1);
+            }
+        };
+        app_state::set_projection(projection, cx);
+
+        // Serves whether or not a window is open, which is the point of it.
+        ui::api_server::start(cx);
 
         open_main_window(cx);
     });

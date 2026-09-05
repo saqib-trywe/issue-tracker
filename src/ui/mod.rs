@@ -3,6 +3,7 @@
 //! `tracker` owns all state; the other modules are `impl IssueTracker` blocks
 //! split by column so each file stays readable.
 
+pub mod api_server;
 mod issue_detail;
 mod issue_list;
 pub mod menus;
