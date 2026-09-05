@@ -49,6 +49,17 @@ impl Status {
         Status::Cancelled,
     ];
 
+    /// Whether this Status represents work that is no longer outstanding.
+    ///
+    /// Done and Cancelled both settle an Issue: one finished, the other was
+    /// deliberately abandoned. Neither is waiting on anybody. This is the
+    /// predicate a parent is measured against before it may be marked Done —
+    /// blocking a parent on a Cancelled child would push you toward deleting
+    /// records the glossary says are worth keeping.
+    pub fn is_settled(self) -> bool {
+        matches!(self, Status::Done | Status::Cancelled)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Status::Todo => "Todo",
@@ -254,6 +265,13 @@ pub struct Issue {
     /// Sorted, and free of case-variant duplicates. Maintained through
     /// [`normalise_tags`].
     pub tags: Vec<Tag>,
+    /// The Issue this one is part of, if any.
+    ///
+    /// Hierarchy is exactly one level deep: an Issue with a parent has no
+    /// sub-issues of its own. Nothing in this type enforces that — it is a
+    /// condition across rows, so it lives in `Projection`. See
+    /// `docs/adr/0007`.
+    pub parent_id: Option<IssueId>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -359,6 +377,7 @@ mod tests {
             status: Status::Todo,
             priority,
             tags: Vec::new(),
+            parent_id: None,
             created_at: at,
             updated_at: at,
         }
@@ -382,6 +401,15 @@ mod tests {
     fn unknown_text_is_rejected_rather_than_defaulted() {
         assert!("Wontfix".parse::<Status>().is_err());
         assert!("Critical".parse::<Priority>().is_err());
+    }
+
+    #[test]
+    fn done_and_cancelled_are_settled_the_rest_are_not() {
+        assert!(Status::Done.is_settled());
+        assert!(Status::Cancelled.is_settled(), "abandoned is still decided");
+        assert!(!Status::Todo.is_settled());
+        assert!(!Status::Doing.is_settled());
+        assert!(!Status::Blocked.is_settled());
     }
 
     #[test]

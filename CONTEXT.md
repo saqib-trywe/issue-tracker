@@ -45,6 +45,18 @@ Case-insensitive, so `Bug` and `bug` are one Tag. Flat — `ui/theme` is a name
 that happens to contain a slash, not a child of `ui`.
 _Avoid_: Label, Category, Topic, Keyword
 
+**Sub-issue**:
+An Issue that is part of another Issue. Exactly one level deep: a Sub-issue has
+no Sub-issues of its own, and belongs to at most one Parent. Being a Sub-issue
+changes nothing else about it — it keeps its own Status, Priority and Tags, and
+appears in the list like anything else.
+_Avoid_: Subtask, Child issue, Checklist item
+
+**Parent**:
+The Issue a Sub-issue is part of. Not a new kind of record: a Parent is an
+ordinary Issue that happens to hold others.
+_Avoid_: Epic, Story, Container
+
 **Tag filter**:
 Narrowing the list to a single Tag. Distinct from a View: a View is predefined
 and a Tag filter is whatever the user invented, and the two compose — a Tag
@@ -59,11 +71,28 @@ These are different acts and both exist:
 - **Delete** erases a mistake. The Issue should never have existed — a typo, a
   stray keystroke. Nothing is worth preserving.
 
+## Completing a Parent
+
+A Parent is Done only once nothing beneath it is outstanding. Done and
+Cancelled both **settle** a Sub-issue: one finished, the other was deliberately
+abandoned, and neither is waiting on anybody.
+
+This holds in both directions — a Sub-issue cannot be reopened while its Parent
+is Done — so the state "a Parent finished above unfinished work" simply does
+not occur. Cancelling a Parent is never blocked: abandoning a piece of work
+does not require tidying its parts first.
+
+Deleting a Parent releases its Sub-issues, which survive as ordinary Issues. A
+Sub-issue may be moved to another Parent, or removed from one entirely.
+
 ## Deliberately absent
 
 - **Assignee / Reporter / Watcher**: one user, no sync. Fields whose only job
   is to coordinate between people carry no information here.
-- **Project**: no grouping concept above Issue.
+- **Project**: no *kind* of record above Issue. Sub-issues group Issues under
+  an Issue, but a Parent is an ordinary Issue — there is still nothing of a
+  different sort sitting above one.
+- **Nesting beyond one level**: a Sub-issue cannot have Sub-issues.
 - **Comment**: a single user talking to themselves. The Issue body serves
   instead.
 - **Renaming a Tag**, or removing one from every Issue at once. A misspelled

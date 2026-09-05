@@ -9,7 +9,7 @@ use gpui_component::{ActiveTheme, Side, Sizable};
 
 use super::tag_colour::colour_for;
 use super::tracker::{IssueTracker, LIST_CONTEXT};
-use crate::domain::{Issue, IssueId, Priority, Status, Tag};
+use crate::domain::{IssueId, Priority, Status, Tag};
 
 impl IssueTracker {
     pub(super) fn render_issue_list(
@@ -21,7 +21,19 @@ impl IssueTracker {
         // Collected into owned rows first: the Issues are borrowed from the
         // shared Projection through `cx`, and building elements needs `cx`
         // mutably. Only what a row displays is cloned — never the body.
-        let visible: Vec<Row> = self.visible_issues(cx).into_iter().map(Row::from).collect();
+        let visible: Vec<Row> = self
+            .visible_issues(cx)
+            .into_iter()
+            .map(|issue| Row {
+                id: issue.id,
+                title: issue.display_title().to_string(),
+                status: issue.status,
+                priority: issue.priority,
+                tags: issue.tags.clone(),
+                parent_id: issue.parent_id,
+                progress: self.settled_progress(issue.id, cx),
+            })
+            .collect();
         let is_empty = visible.is_empty();
         let mut rows = Vec::with_capacity(visible.len());
         for row in visible {
@@ -112,6 +124,8 @@ impl IssueTracker {
             status,
             priority,
             tags,
+            parent_id,
+            progress,
         } = row;
 
         div()
@@ -167,6 +181,12 @@ impl IssueTracker {
                     .when(priority != Priority::None, |this| {
                         this.child(priority.label())
                     })
+                    // Why the Done button is greyed out, visible without
+                    // opening the Issue.
+                    .when_some(progress, |this, (settled, total)| {
+                        this.child(format!("{settled}/{total}"))
+                    })
+                    .when_some(parent_id, |this, parent| this.child(format!("↳ #{parent}")))
                     // Colour is most of why a Tag is legible here at all —
                     // without it these are more grey text competing with the
                     // Status beside them.
@@ -189,16 +209,8 @@ struct Row {
     status: Status,
     priority: Priority,
     tags: Vec<Tag>,
-}
-
-impl From<&Issue> for Row {
-    fn from(issue: &Issue) -> Self {
-        Self {
-            id: issue.id,
-            title: issue.display_title().to_string(),
-            status: issue.status,
-            priority: issue.priority,
-            tags: issue.tags.clone(),
-        }
-    }
+    /// Set when this Issue is part of another one.
+    parent_id: Option<IssueId>,
+    /// Settled-over-total for this Issue's own parts, when it has any.
+    progress: Option<(usize, usize)>,
 }

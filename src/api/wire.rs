@@ -19,15 +19,24 @@ pub struct IssueJson {
     pub status: String,
     pub priority: String,
     pub tags: Vec<String>,
+    /// The Issue this one is part of. Read-only here: attach and detach go
+    /// through `PUT`/`DELETE /issues/{parent}/sub-issues/{child}`.
+    pub parent_id: Option<IssueId>,
+    /// Read-only, and in display order.
+    pub sub_issue_ids: Vec<IssueId>,
     pub created_at: String,
     /// Present from the first release so `If-Match` can be added later without
     /// changing the shape clients already parse.
     pub updated_at: String,
 }
 
-impl From<&Issue> for IssueJson {
-    fn from(issue: &Issue) -> Self {
+impl IssueJson {
+    /// Sub-issue ids come from the caller because an Issue does not know its
+    /// own children — that is a fact about the whole corpus.
+    pub fn new(issue: &Issue, sub_issue_ids: Vec<IssueId>) -> Self {
         Self {
+            sub_issue_ids,
+            parent_id: issue.parent_id,
             id: issue.id,
             title: issue.title.clone(),
             body: issue.body.clone(),
@@ -60,6 +69,11 @@ pub struct TagJson {
 #[derive(Debug, Deserialize)]
 pub struct NewIssue {
     pub title: String,
+    /// Accepted at creation, where "absent" unambiguously means "no parent" —
+    /// the ambiguity that keeps it out of `PATCH` does not arise here, and
+    /// filing a sub-issue should not need two calls. See `docs/adr/0007`.
+    #[serde(default)]
+    pub parent_id: Option<IssueId>,
     #[serde(flatten)]
     pub rest: PatchIssue,
 }
@@ -78,6 +92,12 @@ pub struct PatchIssue {
     pub priority: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Present only so it can be *rejected* with a pointer to the right
+    /// endpoint. Typed as a raw value because `Option<IssueId>` cannot tell an
+    /// absent key from an explicit `null`, and silently ignoring an attempted
+    /// re-parent would be a trap.
+    #[serde(default)]
+    pub parent_id: Option<serde_json::Value>,
 }
 
 impl PatchIssue {
@@ -176,13 +196,16 @@ mod tests {
             status: Status::Cancelled,
             priority: Priority::Urgent,
             tags: vec!["Bug".parse().unwrap()],
+            parent_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let json = IssueJson::from(&issue);
+        let json = IssueJson::new(&issue, vec![9]);
         assert_eq!(json.status, "Cancelled");
         assert_eq!(json.priority, "Urgent");
         assert_eq!(json.tags, vec!["Bug".to_string()]);
+        assert_eq!(json.parent_id, None);
+        assert_eq!(json.sub_issue_ids, vec![9]);
         // Round-trips back through the same parser the store uses.
         assert_eq!(json.status.parse::<Status>().unwrap(), Status::Cancelled);
     }

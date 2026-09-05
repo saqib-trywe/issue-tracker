@@ -20,7 +20,7 @@ use crate::domain::{Issue, IssueId, Priority, Status, Tag};
 /// never touch real data.
 pub const DB_PATH_ENV: &str = "ISSUE_TRACKER_DB";
 
-const SELECT_COLUMNS: &str = "id, title, body, status, priority, created_at, updated_at";
+const SELECT_COLUMNS: &str = "id, title, body, status, priority, created_at, updated_at, parent_id";
 
 pub struct Store {
     conn: Connection,
@@ -129,7 +129,8 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE issue
-                SET title = ?2, body = ?3, status = ?4, priority = ?5, updated_at = ?6
+                SET title = ?2, body = ?3, status = ?4, priority = ?5, updated_at = ?6,
+                    parent_id = ?7
               WHERE id = ?1",
             rusqlite::params![
                 issue.id,
@@ -138,6 +139,7 @@ impl Store {
                 issue.status.label(),
                 issue.priority.label(),
                 format_timestamp(now),
+                issue.parent_id,
             ],
         )?;
 
@@ -262,6 +264,7 @@ fn read_issue(row: &Row<'_>) -> rusqlite::Result<Issue> {
         tags: Vec::new(),
         created_at: parse_timestamp(&row.get::<_, String>(5)?)?,
         updated_at: parse_timestamp(&row.get::<_, String>(6)?)?,
+        parent_id: row.get(7)?,
     })
 }
 

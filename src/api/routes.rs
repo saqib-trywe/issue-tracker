@@ -9,13 +9,14 @@ use serde::de::DeserializeOwned;
 
 use super::http::{Request, Response};
 use super::wire::{IssueJson, NewIssue, PatchIssue, TagJson};
-use crate::domain::{IssueId, Status, Tag};
-use crate::projection::Projection;
+use crate::domain::{Issue, IssueId, Status, Tag};
+use crate::projection::{Projection, WriteError};
 
 enum Route {
     Issues,
     Issue(IssueId),
     IssueTag(IssueId, String),
+    IssueSubIssue(IssueId, IssueId),
     Tags,
 }
 
@@ -36,6 +37,14 @@ fn route(path: &str) -> Option<Route> {
     if tail.is_empty() {
         return Some(Route::Issue(id));
     }
+    // Matched before Tags: unlike a Tag name, a sub-issue is addressed by id,
+    // so this segment is numeric and cannot contain a slash.
+    if let Some(child) = tail.strip_prefix("/sub-issues/") {
+        return child
+            .parse()
+            .ok()
+            .map(|child| Route::IssueSubIssue(id, child));
+    }
     // Everything after `/tags/` is the name, however many slashes it holds.
     let name = tail.strip_prefix("/tags/")?;
     if name.is_empty() {
@@ -55,20 +64,37 @@ pub fn dispatch(request: &Request, projection: &mut Projection) -> Response {
         (Route::Issues, _) => method_not_allowed("GET, POST"),
 
         (Route::Issue(id), "GET") => match projection.get(id) {
-            Some(issue) => Response::json(200, &IssueJson::from(issue)),
+            Some(issue) => Response::json(200, &issue_json(projection, issue)),
             None => not_found(id),
         },
         (Route::Issue(id), "PATCH") => patch_issue(id, request, projection),
         (Route::Issue(id), "DELETE") => match projection.delete(id) {
-            Ok(true) => Response::empty(204),
-            Ok(false) => not_found(id),
-            Err(err) => Response::error(500, err),
+            Ok(()) => Response::empty(204),
+            Err(err) => write_error(err),
         },
         (Route::Issue(_), _) => method_not_allowed("GET, PATCH, DELETE"),
 
         (Route::IssueTag(id, name), "PUT") => change_tag(id, &name, projection, true),
         (Route::IssueTag(id, name), "DELETE") => change_tag(id, &name, projection, false),
         (Route::IssueTag(..), _) => method_not_allowed("PUT, DELETE"),
+
+        // `PUT` on an Issue that already belongs elsewhere *moves* it: the
+        // request says where the child should end up, which is all a move is.
+        (Route::IssueSubIssue(parent, child), "PUT") => {
+            written(projection.set_parent(child, Some(parent)), projection)
+        }
+        (Route::IssueSubIssue(parent, child), "DELETE") => {
+            match projection.get(child).map(|issue| issue.parent_id) {
+                None => not_found(child),
+                // Detaching from an Issue that does not hold it is a mistake
+                // worth reporting rather than a silent success.
+                Some(current) if current != Some(parent) => {
+                    Response::error(409, format!("#{child} is not a sub-issue of #{parent}"))
+                }
+                Some(_) => written(projection.set_parent(child, None), projection),
+            }
+        }
+        (Route::IssueSubIssue(..), _) => method_not_allowed("PUT, DELETE"),
 
         (Route::Tags, "GET") => list_tags(projection),
         (Route::Tags, _) => method_not_allowed("GET"),
@@ -107,7 +133,7 @@ fn list_issues(request: &Request, projection: &Projection) -> Response {
                 .as_ref()
                 .is_none_or(|needle| issue.title.to_lowercase().contains(needle))
         })
-        .map(IssueJson::from)
+        .map(|issue| issue_json(projection, issue))
         .collect();
 
     Response::json(200, &issues)
@@ -123,16 +149,33 @@ fn create_issue(request: &Request, projection: &mut Projection) -> Response {
     if title.is_empty() {
         return Response::error(400, "title must not be blank");
     }
+    if new.rest.parent_id.is_some() {
+        return Response::error(
+            400,
+            "use \"parent_id\" at the top level of the body, not inside a patch",
+        );
+    }
     let patch = match new.rest.into_patch() {
         Ok(patch) => patch,
         Err(err) => return Response::error(400, err),
     };
 
-    match projection.create(&title, patch) {
-        Ok(issue) => Response::json(201, &IssueJson::from(&issue))
-            .with_header("Location", format!("/issues/{}", issue.id)),
-        Err(err) => Response::error(500, err),
+    let created = match projection.create(&title, patch) {
+        Ok(issue) => issue,
+        Err(err) => return write_error(err),
+    };
+
+    // Applied after creation so it goes through exactly the checks an attach
+    // would; a refusal here leaves the Issue created but unparented.
+    if let Some(parent) = new.parent_id
+        && let Err(err) = projection.set_parent(created.id, Some(parent))
+    {
+        return write_error(err);
     }
+
+    let issue = projection.get(created.id).expect("just created");
+    Response::json(201, &issue_json(projection, issue))
+        .with_header("Location", format!("/issues/{}", created.id))
 }
 
 fn patch_issue(id: IssueId, request: &Request, projection: &mut Projection) -> Response {
@@ -140,16 +183,22 @@ fn patch_issue(id: IssueId, request: &Request, projection: &mut Projection) -> R
         Ok(body) => body,
         Err(response) => return response,
     };
+    // Rejected loudly rather than ignored: a caller who thinks they moved an
+    // Issue and did not would have no way to tell.
+    if body.parent_id.is_some() {
+        return Response::error(
+            400,
+            format!(
+                "parent_id is not patchable; use PUT or DELETE /issues/{{parent}}/sub-issues/{id}"
+            ),
+        );
+    }
     let patch = match body.into_patch() {
         Ok(patch) => patch,
         Err(err) => return Response::error(400, err),
     };
 
-    match projection.patch(id, patch) {
-        Ok(Some(issue)) => Response::json(200, &IssueJson::from(&issue)),
-        Ok(None) => not_found(id),
-        Err(err) => Response::error(500, err),
-    }
+    written(projection.patch(id, patch), projection)
 }
 
 /// `PUT`/`DELETE /issues/{id}/tags/{name}`.
@@ -168,11 +217,7 @@ fn change_tag(id: IssueId, name: &str, projection: &mut Projection, add: bool) -
         projection.remove_tag(id, &tag)
     };
 
-    match outcome {
-        Ok(Some(issue)) => Response::json(200, &IssueJson::from(&issue)),
-        Ok(None) => not_found(id),
-        Err(err) => Response::error(500, err),
-    }
+    written(outcome, projection)
 }
 
 /// `GET /tags` — the same derived list the sidebar shows, with the same counts.
@@ -199,6 +244,37 @@ fn json_body<T: DeserializeOwned>(request: &Request) -> Result<T, Response> {
         &request.body
     };
     serde_json::from_slice(raw).map_err(|err| Response::error(400, format!("invalid body: {err}")))
+}
+
+/// Renders an Issue together with the ids of its sub-issues.
+fn issue_json(projection: &Projection, issue: &Issue) -> IssueJson {
+    IssueJson::new(
+        issue,
+        projection
+            .sub_issues(issue.id)
+            .iter()
+            .map(|child| child.id)
+            .collect(),
+    )
+}
+
+/// Turns the outcome of a mutation into a response.
+///
+/// The three cases are deliberately distinct: 404 for a thing that is not
+/// there, 409 for a request the data forbids, 500 for a database that failed.
+fn written(outcome: Result<Issue, WriteError>, projection: &Projection) -> Response {
+    match outcome {
+        Ok(issue) => Response::json(200, &issue_json(projection, &issue)),
+        Err(err) => write_error(err),
+    }
+}
+
+fn write_error(err: WriteError) -> Response {
+    match err {
+        WriteError::NotFound(id) => not_found(id),
+        WriteError::Refused(refusal) => Response::error(409, refusal),
+        WriteError::Store(err) => Response::error(500, format!("{err:#}")),
+    }
 }
 
 fn not_found(id: IssueId) -> Response {
@@ -490,6 +566,232 @@ mod tests {
     fn tagging_a_missing_issue_is_404() {
         let mut p = projection();
         assert_eq!(send(&mut p, "PUT", "/issues/404/tags/Bug", "").status, 404);
+    }
+
+    // ---- sub-issues ---------------------------------------------------------
+
+    fn make(p: &mut Projection, title: &str) -> crate::domain::IssueId {
+        p.create(title, IssuePatch::default()).unwrap().id
+    }
+
+    #[test]
+    fn attaching_and_detaching_over_http() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        let child = make(&mut p, "child");
+
+        let attached = send(
+            &mut p,
+            "PUT",
+            &format!("/issues/{parent}/sub-issues/{child}"),
+            "",
+        );
+        assert_eq!(attached.status, 200);
+        assert_eq!(json(&attached)["parent_id"], parent);
+
+        let parent_view = send(&mut p, "GET", &format!("/issues/{parent}"), "");
+        assert_eq!(
+            json(&parent_view)["sub_issue_ids"],
+            serde_json::json!([child])
+        );
+
+        let detached = send(
+            &mut p,
+            "DELETE",
+            &format!("/issues/{parent}/sub-issues/{child}"),
+            "",
+        );
+        assert_eq!(detached.status, 200);
+        assert_eq!(json(&detached)["parent_id"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn putting_under_a_new_parent_moves_it() {
+        let mut p = projection();
+        let first = make(&mut p, "first");
+        let second = make(&mut p, "second");
+        let child = make(&mut p, "child");
+        send(
+            &mut p,
+            "PUT",
+            &format!("/issues/{first}/sub-issues/{child}"),
+            "",
+        );
+
+        let moved = send(
+            &mut p,
+            "PUT",
+            &format!("/issues/{second}/sub-issues/{child}"),
+            "",
+        );
+
+        assert_eq!(moved.status, 200);
+        assert_eq!(json(&moved)["parent_id"], second);
+        let old = send(&mut p, "GET", &format!("/issues/{first}"), "");
+        assert_eq!(json(&old)["sub_issue_ids"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn detaching_from_the_wrong_parent_is_reported() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        let other = make(&mut p, "other");
+        let child = make(&mut p, "child");
+        send(
+            &mut p,
+            "PUT",
+            &format!("/issues/{parent}/sub-issues/{child}"),
+            "",
+        );
+
+        let wrong = send(
+            &mut p,
+            "DELETE",
+            &format!("/issues/{other}/sub-issues/{child}"),
+            "",
+        );
+        assert_eq!(wrong.status, 409);
+    }
+
+    #[test]
+    fn rule_violations_are_409_not_400() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        let child = make(&mut p, "child");
+        let outsider = make(&mut p, "outsider");
+        send(
+            &mut p,
+            "PUT",
+            &format!("/issues/{parent}/sub-issues/{child}"),
+            "",
+        );
+
+        // Depth, from both ends.
+        assert_eq!(
+            send(
+                &mut p,
+                "PUT",
+                &format!("/issues/{child}/sub-issues/{outsider}"),
+                ""
+            )
+            .status,
+            409
+        );
+        assert_eq!(
+            send(
+                &mut p,
+                "PUT",
+                &format!("/issues/{outsider}/sub-issues/{parent}"),
+                ""
+            )
+            .status,
+            409
+        );
+        // Self-parenting.
+        assert_eq!(
+            send(
+                &mut p,
+                "PUT",
+                &format!("/issues/{parent}/sub-issues/{parent}"),
+                ""
+            )
+            .status,
+            409
+        );
+        // Completing above outstanding work.
+        let blocked = send(
+            &mut p,
+            "PATCH",
+            &format!("/issues/{parent}"),
+            r#"{"status":"Done"}"#,
+        );
+        assert_eq!(blocked.status, 409);
+        assert!(
+            json(&blocked)["error"]
+                .as_str()
+                .unwrap()
+                .contains("outstanding")
+        );
+    }
+
+    #[test]
+    fn a_missing_issue_on_either_end_is_404() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        assert_eq!(
+            send(
+                &mut p,
+                "PUT",
+                &format!("/issues/{parent}/sub-issues/999"),
+                ""
+            )
+            .status,
+            404
+        );
+        assert_eq!(
+            send(
+                &mut p,
+                "PUT",
+                &format!("/issues/999/sub-issues/{parent}"),
+                ""
+            )
+            .status,
+            404
+        );
+    }
+
+    #[test]
+    fn creating_a_sub_issue_takes_one_call() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+
+        let response = send(
+            &mut p,
+            "POST",
+            "/issues",
+            &format!(r#"{{"title":"child","parent_id":{parent}}}"#),
+        );
+
+        assert_eq!(response.status, 201);
+        assert_eq!(json(&response)["parent_id"], parent);
+    }
+
+    #[test]
+    fn patching_parent_id_points_at_the_right_endpoint() {
+        // Silently ignoring it would leave a caller believing they moved
+        // something they did not.
+        let mut p = projection();
+        let child = make(&mut p, "child");
+        let parent = make(&mut p, "parent");
+
+        let response = send(
+            &mut p,
+            "PATCH",
+            &format!("/issues/{child}"),
+            &format!(r#"{{"parent_id":{parent}}}"#),
+        );
+
+        assert_eq!(response.status, 400);
+        assert!(
+            json(&response)["error"]
+                .as_str()
+                .unwrap()
+                .contains("sub-issues")
+        );
+    }
+
+    #[test]
+    fn a_wrong_method_on_a_sub_issue_says_what_is_allowed() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        let child = make(&mut p, "child");
+        let response = send(
+            &mut p,
+            "GET",
+            &format!("/issues/{parent}/sub-issues/{child}"),
+            "",
+        );
+        assert_eq!(response.status, 405);
     }
 
     #[test]

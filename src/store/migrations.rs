@@ -39,6 +39,14 @@ pub fn migrations() -> Migrations<'static> {
              PRIMARY KEY (issue_id, name)
          ) WITHOUT ROWID;",
         ),
+        // Sub-issues. One level deep and one parent per Issue, so this is a
+        // column rather than a junction table. `ON DELETE SET NULL` is what
+        // orphans the children of a deleted parent instead of erasing work
+        // nobody asked to erase — see docs/adr/0007.
+        M::up(
+            "ALTER TABLE issue
+             ADD COLUMN parent_id INTEGER REFERENCES issue(id) ON DELETE SET NULL;",
+        ),
     ])
 }
 

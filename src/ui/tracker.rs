@@ -19,12 +19,41 @@ use gpui_component::select::{SelectEvent, SelectState};
 
 use super::theme_catalogue::{ThemeCatalogue, ThemeListDelegate};
 use crate::domain::{Issue, IssueId, Priority, Status, Tag, View};
-use crate::projection::{IssuePatch, Projection};
+use crate::projection::{IssuePatch, Projection, Written};
 use crate::store::settings_keys;
 
 /// The Tag editor in the detail pane. Tags are plain names, so the delegate is
 /// the library's own `SearchableVec` and no custom one is needed.
 pub(super) type TagCombobox = ComboboxState<SearchableVec<String>>;
+
+/// A picker over Issues. Entries read `#12 Title`, optionally annotated with
+/// the parent they would be taken from.
+pub(super) type IssueCombobox = ComboboxState<SearchableVec<String>>;
+
+/// How an Issue is spelled inside a picker.
+fn issue_label(issue: &Issue) -> String {
+    format!("#{} {}", issue.id, issue.display_title())
+}
+
+/// The same, annotated when the Issue already belongs to someone.
+///
+/// Attaching it would move it, so the row has to say what it would be taken
+/// from — without that this would be a silent theft from another Issue.
+fn issue_label_annotated(issue: &Issue, projection: &Projection) -> String {
+    match issue.parent_id.and_then(|id| projection.get(id)) {
+        Some(parent) => format!("{} · under #{}", issue_label(issue), parent.id),
+        None => issue_label(issue),
+    }
+}
+
+/// Recovers the id from a picker entry.
+fn id_from_label(label: &str) -> Option<IssueId> {
+    label.strip_prefix('#')?.split(' ').next()?.parse().ok()
+}
+
+fn issue_items(labels: Vec<String>) -> SearchableVec<String> {
+    SearchableVec::new(labels)
+}
 
 fn tag_items(in_use: &BTreeSet<Tag>) -> SearchableVec<String> {
     SearchableVec::new(
@@ -53,6 +82,7 @@ actions!(
         DeleteIssue,
         FocusFilter,
         FocusTags,
+        FocusSubIssues,
         CancelEditing,
         ToggleSidebar,
         Quit,
@@ -123,6 +153,7 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("x", DeleteIssue, Some(LIST_CONTEXT)),
         KeyBinding::new("/", FocusFilter, Some(LIST_CONTEXT)),
         KeyBinding::new("t", FocusTags, Some(LIST_CONTEXT)),
+        KeyBinding::new("s", FocusSubIssues, Some(LIST_CONTEXT)),
         KeyBinding::new("escape", CancelEditing, None),
         // Deliberately unscoped: unlike j/k/c these have to work while a text
         // input has focus, and cmd chords cannot collide with typing.
@@ -169,6 +200,11 @@ pub struct IssueTracker {
     /// resolved back to the config it applies.
     catalogue: ThemeCatalogue,
     pub(super) tag_select: Entity<TagCombobox>,
+    /// Adds a sub-issue to the selected Issue.
+    pub(super) sub_issue_select: Entity<IssueCombobox>,
+    /// Chooses the selected Issue's parent. Clearing it detaches; choosing a
+    /// different one moves it.
+    pub(super) parent_select: Entity<IssueCombobox>,
     pub(super) light_select: Entity<SelectState<ThemeListDelegate>>,
     pub(super) dark_select: Entity<SelectState<ThemeListDelegate>>,
 
@@ -257,6 +293,13 @@ impl IssueTracker {
                 .searchable(true)
         });
 
+        let sub_issue_select = cx.new(|cx| {
+            ComboboxState::new(issue_items(Vec::new()), Vec::new(), window, cx).searchable(true)
+        });
+        let parent_select = cx.new(|cx| {
+            ComboboxState::new(issue_items(Vec::new()), Vec::new(), window, cx).searchable(true)
+        });
+
         let filter_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter titles…"));
         let new_issue_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("New issue title…"));
@@ -316,6 +359,30 @@ impl IssueTracker {
                 },
             ),
             cx.subscribe_in(
+                &sub_issue_select,
+                window,
+                |this, _, event: &ComboboxEvent<SearchableVec<String>>, window, cx| {
+                    let ComboboxEvent::Change(values) = event else {
+                        return;
+                    };
+                    if let Some(child) = values.first().and_then(|label| id_from_label(label)) {
+                        this.attach_sub_issue(child, window, cx);
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &parent_select,
+                window,
+                |this, _, event: &ComboboxEvent<SearchableVec<String>>, window, cx| {
+                    let ComboboxEvent::Change(values) = event else {
+                        return;
+                    };
+                    // An empty selection is the clear affordance: detach.
+                    let parent = values.first().and_then(|label| id_from_label(label));
+                    this.set_parent(parent, window, cx);
+                },
+            ),
+            cx.subscribe_in(
                 &light_select,
                 window,
                 |this, _, event: &SelectEvent<ThemeListDelegate>, window, cx| {
@@ -368,6 +435,8 @@ impl IssueTracker {
             ui_state_task: None,
             catalogue,
             tag_select,
+            sub_issue_select,
+            parent_select,
             light_select,
             dark_select,
             _subscriptions: subscriptions,
@@ -448,6 +517,30 @@ impl IssueTracker {
         self.projection.read(cx).get(self.selected?)
     }
 
+    /// The selected Issue's parts, in display order.
+    pub(super) fn selected_sub_issues(&self, cx: &App) -> Vec<Issue> {
+        let Some(id) = self.selected else {
+            return Vec::new();
+        };
+        self.projection
+            .read(cx)
+            .sub_issues(id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// The Issue the selected one is part of, if any.
+    pub(super) fn selected_parent(&self, cx: &App) -> Option<Issue> {
+        let parent = self.selected_issue(cx)?.parent_id?;
+        self.projection.read(cx).get(parent).cloned()
+    }
+
+    /// Settled-over-total for an Issue's parts, or `None` when it has none.
+    pub(super) fn settled_progress(&self, id: IssueId, cx: &App) -> Option<(usize, usize)> {
+        self.projection.read(cx).settled_progress(id)
+    }
+
     /// How many Issues a View would show, ignoring the filter.
     pub(super) fn count_for(&self, view: View, cx: &App) -> usize {
         self.projection
@@ -471,7 +564,6 @@ impl IssueTracker {
         self.ensure_selection_visible(cx);
         let selection_moved = was_selected != self.selected;
         self.refresh_inputs(selection_moved, window, cx);
-        self.sync_tag_select(window, cx);
         cx.notify();
     }
 
@@ -504,6 +596,13 @@ impl IssueTracker {
             self.body_input
                 .update(cx, |input, cx| input.set_value(body, window, cx));
         }
+
+        // The pickers are part of "what the selected Issue looks like", so
+        // they are re-pointed here rather than by each caller. Leaving this to
+        // callers is exactly how the tag box and the parent box came to show
+        // the previously selected Issue's answers.
+        self.sync_tag_select(window, cx);
+        self.sync_relation_selects(window, cx);
     }
 
     /// Applies a change to the shared Projection and notifies its observers.
@@ -514,7 +613,7 @@ impl IssueTracker {
     fn write<T>(
         &self,
         cx: &mut App,
-        change: impl FnOnce(&mut Projection) -> anyhow::Result<T>,
+        change: impl FnOnce(&mut Projection) -> Written<T>,
     ) -> Option<T> {
         self.projection
             .update(cx, |projection, cx| match change(projection) {
@@ -523,7 +622,10 @@ impl IssueTracker {
                     Some(value)
                 }
                 Err(err) => {
-                    eprintln!("failed to write to the issue store: {err:#}");
+                    // Refusals are mostly unreachable from the UI, which
+                    // disables or filters out the controls that would cause
+                    // them; anything arriving here is worth seeing.
+                    eprintln!("failed to write to the issue store: {err}");
                     None
                 }
             })
@@ -717,6 +819,91 @@ impl IssueTracker {
         let Some(id) = self.selected else { return };
         self.write(cx, |projection| projection.remove_tag(id, &tag));
         self.sync_tag_select(window, cx);
+    }
+
+    /// Files an existing Issue under the selected one.
+    pub(super) fn attach_sub_issue(
+        &mut self,
+        child: IssueId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(parent) = self.selected else { return };
+        self.write(cx, |projection| projection.set_parent(child, Some(parent)));
+        self.sync_relation_selects(window, cx);
+    }
+
+    /// Removes one of the selected Issue's parts, which becomes top-level.
+    pub(super) fn detach_sub_issue(
+        &mut self,
+        child: IssueId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.write(cx, |projection| projection.set_parent(child, None));
+        self.sync_relation_selects(window, cx);
+    }
+
+    /// Files the selected Issue under `parent`, or removes it from whatever
+    /// holds it. Choosing a different parent moves it; there is no separate
+    /// move operation.
+    pub(super) fn set_parent(
+        &mut self,
+        parent: Option<IssueId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected else { return };
+        if self
+            .selected_issue(cx)
+            .is_some_and(|issue| issue.parent_id == parent)
+        {
+            return;
+        }
+        self.write(cx, |projection| projection.set_parent(id, parent));
+        self.sync_relation_selects(window, cx);
+    }
+
+    /// Points both relationship pickers at what is currently possible.
+    ///
+    /// Candidates are filtered to what `Projection` would actually accept, so
+    /// the refusals exist for the API's benefit rather than being reachable by
+    /// clicking.
+    fn sync_relation_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else { return };
+
+        let (children, parents, current_parent) = {
+            let projection = self.projection.read(cx);
+            (
+                projection
+                    .eligible_sub_issues(id)
+                    .iter()
+                    .map(|issue| issue_label_annotated(issue, projection))
+                    .collect::<Vec<_>>(),
+                projection
+                    .eligible_parents(id)
+                    .iter()
+                    .map(|issue| issue_label(issue))
+                    .collect::<Vec<_>>(),
+                projection
+                    .get(id)
+                    .and_then(|issue| issue.parent_id)
+                    .and_then(|parent| projection.get(parent))
+                    .map(issue_label),
+            )
+        };
+
+        self.sub_issue_select.update(cx, |state, cx| {
+            state.set_items(issue_items(children), window, cx);
+            // Nothing stays selected here: this control is an action, and the
+            // Issue it just attached is no longer a candidate.
+            state.set_selected_values(&[], window, cx);
+        });
+        self.parent_select.update(cx, |state, cx| {
+            state.set_items(issue_items(parents), window, cx);
+            let selected: Vec<String> = current_parent.into_iter().collect();
+            state.set_selected_values(&selected, window, cx);
+        });
     }
 
     /// Points the Combobox at the current Tag vocabulary and the selected
@@ -977,7 +1164,8 @@ impl IssueTracker {
         else {
             return;
         };
-        self.confirm_delete(id, title, window, cx);
+        let sub_issue_count = self.selected_sub_issues(cx).len();
+        self.confirm_delete(id, title, sub_issue_count, window, cx);
     }
 
     fn on_focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
@@ -988,6 +1176,18 @@ impl IssueTracker {
     fn on_focus_tags(&mut self, _: &FocusTags, window: &mut Window, cx: &mut Context<Self>) {
         if self.selected.is_some() {
             self.tag_select
+                .update(cx, |state, cx| state.focus(window, cx));
+        }
+    }
+
+    fn on_focus_sub_issues(
+        &mut self,
+        _: &FocusSubIssues,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected.is_some() {
+            self.sub_issue_select
                 .update(cx, |state, cx| state.focus(window, cx));
         }
     }
@@ -1040,6 +1240,7 @@ impl Render for IssueTracker {
             .on_action(cx.listener(Self::on_delete_issue))
             .on_action(cx.listener(Self::on_focus_filter))
             .on_action(cx.listener(Self::on_focus_tags))
+            .on_action(cx.listener(Self::on_focus_sub_issues))
             .on_action(cx.listener(Self::on_cancel_editing))
             .on_action(cx.listener(Self::on_toggle_sidebar))
             .on_action(cx.listener(Self::on_quit))
