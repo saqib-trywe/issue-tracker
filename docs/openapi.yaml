@@ -606,7 +606,8 @@ components:
       type: object
       description: An Issue as it goes out. Every field is always present.
       required:
-        [id, title, body, status, priority, tags, parent_id, sub_issue_ids, created_at, updated_at]
+        [id, title, body, status, priority, tags, parent_id, sub_issue_ids,
+         settled_sub_issues, created_at, updated_at]
       properties:
         id:
           $ref: '#/components/schemas/IssueId'
@@ -639,6 +640,18 @@ components:
             always empty.
           items:
             $ref: '#/components/schemas/IssueId'
+        settled_sub_issues:
+          type: integer
+          minimum: 0
+          description: |
+            How many of `sub_issue_ids` are settled — Done or Cancelled. The
+            total is `sub_issue_ids.len()`, so only this half is sent; two
+            spellings of one number could disagree with each other.
+
+            It is the whole fraction regardless of the narrowing that produced
+            this response, so a filter that hides a parent's children does not
+            change the parent's progress. Read-only, and `0` when there are no
+            sub-issues.
         created_at:
           type: string
           format: date-time
@@ -660,6 +673,7 @@ components:
           tags: [cli]
           parent_id: null
           sub_issue_ids: [2, 3]
+          settled_sub_issues: 1
           created_at: '2026-09-05T09:14:02.481221Z'
           updated_at: '2026-09-05T09:20:44.010933Z'
 

@@ -5,13 +5,11 @@
 //! Pure with respect to the network: everything here takes already-fetched
 //! values, which is what makes it testable without a socket.
 
-use std::collections::HashMap;
-
 use chrono::{DateTime, Local};
 use termcolor::{Color, ColorSpec, WriteColor};
 
 use crate::api::wire::{IssueJson, TagJson};
-use crate::domain::{IssueId, Priority, Status, display_title};
+use crate::domain::{Priority, Status, display_title};
 
 /// How much of a title survives. Fixed rather than measured: fitting the
 /// terminal would mean a `TIOCGWINSZ` ioctl, and an `unsafe` block for column
@@ -21,11 +19,7 @@ const TITLE_WIDTH: usize = 52;
 const STATUS_WIDTH: usize = 9;
 const PRIORITY_WIDTH: usize = 8;
 
-pub fn list(
-    out: &mut dyn WriteColor,
-    issues: &[IssueJson],
-    settled: &Settled,
-) -> std::io::Result<()> {
+pub fn list(out: &mut dyn WriteColor, issues: &[IssueJson]) -> std::io::Result<()> {
     if issues.is_empty() {
         return writeln!(out, "No issues.");
     }
@@ -53,7 +47,7 @@ pub fn list(
         coloured(out, priority_colour(&issue.priority), |out| {
             write!(out, "{:<PRIORITY_WIDTH$}  ", issue.priority)
         })?;
-        write!(out, "{:<TITLE_WIDTH$}  ", title_cell(issue, settled))?;
+        write!(out, "{:<TITLE_WIDTH$}  ", title_cell(issue))?;
         dim(out, |out| writeln!(out, "{}", issue.tags.join(", ")))?;
     }
     Ok(())
@@ -71,7 +65,7 @@ pub fn show(
     coloured(out, status_colour(&issue.status), |out| {
         write!(out, "{}", issue.status)
     })?;
-    let outstanding = children.iter().filter(|child| !is_settled(child)).count();
+    let outstanding = issue.sub_issue_ids.len() - issue.settled_sub_issues;
     if outstanding > 0 {
         dim(out, |out| {
             write!(out, "  ({outstanding} sub-issue(s) outstanding)")
@@ -99,7 +93,7 @@ pub fn show(
         )?;
     }
     if !children.is_empty() {
-        let done = children.len() - outstanding;
+        let done = issue.settled_sub_issues;
         writeln!(out, "  Sub-issues ({done}/{} done)", children.len())?;
         for child in children {
             write!(out, "    #{:<5} ", child.id)?;
@@ -139,58 +133,21 @@ pub fn tags(out: &mut dyn WriteColor, tags: &[TagJson]) -> std::io::Result<()> {
 
 // ---- the sub-issue markers --------------------------------------------------
 
-/// Which Issues are settled, so a parent's progress can be counted.
 ///
 /// Built from whichever Issues were fetched. `list` completes it with a second
 /// request when a filter left some children out, rather than printing a
 /// fraction that quietly excludes them.
-#[derive(Default)]
-pub struct Settled(HashMap<IssueId, bool>);
-
-impl Settled {
-    pub fn from(issues: &[IssueJson]) -> Self {
-        Settled(
-            issues
-                .iter()
-                .map(|issue| (issue.id, is_settled(issue)))
-                .collect(),
-        )
-    }
-
-    /// True when every sub-issue named by `issues` was among them.
-    pub fn covers(&self, issues: &[IssueJson]) -> bool {
-        issues
-            .iter()
-            .flat_map(|issue| issue.sub_issue_ids.iter())
-            .all(|id| self.0.contains_key(id))
-    }
-
-    fn progress(&self, issue: &IssueJson) -> Option<String> {
-        if issue.sub_issue_ids.is_empty() {
-            return None;
-        }
-        let done = issue
-            .sub_issue_ids
-            .iter()
-            .filter(|id| self.0.get(id).copied().unwrap_or(false))
-            .count();
-        Some(format!("[{done}/{}]", issue.sub_issue_ids.len()))
-    }
-}
-
-/// The two markers the UI's row carries, in the UI's own spelling.
-///
-/// A sub-issue names its parent by id rather than showing a bare arrow, so the
-/// obvious next command (`issue show 12`) is already on the screen.
-fn title_cell(issue: &IssueJson, settled: &Settled) -> String {
+fn title_cell(issue: &IssueJson) -> String {
     let prefix = match issue.parent_id {
         Some(parent) => format!("↳ #{parent} "),
         None => String::new(),
     };
-    let suffix = settled
-        .progress(issue)
-        .map(|progress| format!(" {progress}"))
-        .unwrap_or_default();
+    // The API sends the fraction, so a filter that hides a parent's children
+    // can no longer make it quietly wrong.
+    let suffix = match issue.sub_issue_ids.len() {
+        0 => String::new(),
+        total => format!(" [{}/{total}]", issue.settled_sub_issues),
+    };
 
     let budget = TITLE_WIDTH.saturating_sub(width(&prefix) + width(&suffix));
     format!(
@@ -214,15 +171,6 @@ fn width(text: &str) -> usize {
     text.chars().count()
 }
 
-fn is_settled(issue: &IssueJson) -> bool {
-    // Parsed rather than string-matched, so this cannot drift from the domain.
-    issue
-        .status
-        .parse::<Status>()
-        .map(|status| status.is_settled())
-        .unwrap_or(false)
-}
-
 /// RFC3339 with microseconds is right on the wire and noise on a screen.
 fn timestamp(raw: &str) -> String {
     match DateTime::parse_from_rfc3339(raw) {
@@ -236,7 +184,7 @@ fn timestamp(raw: &str) -> String {
 
 // ---- colour -----------------------------------------------------------------
 
-/// Parsed rather than string-matched, for the same reason [`is_settled`] is:
+/// Parsed rather than string-matched, so that adding a sixth Status is:
 /// a sixth Status is then a non-exhaustive match here — a compile error —
 /// rather than a column that silently loses its colour.
 fn status_colour(status: &str) -> Option<Color> {
@@ -286,6 +234,7 @@ fn dim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::IssueId;
     use termcolor::Buffer;
 
     fn issue(id: IssueId, title: &str, status: &str) -> IssueJson {
@@ -298,6 +247,7 @@ mod tests {
             tags: Vec::new(),
             parent_id: None,
             sub_issue_ids: Vec::new(),
+            settled_sub_issues: 0,
             created_at: "2026-09-05T14:23:11.482913Z".to_string(),
             updated_at: "2026-09-05T14:23:11.482913Z".to_string(),
         }
@@ -314,7 +264,7 @@ mod tests {
         // The window shows "Untitled" for a title the user has not typed yet.
         // Printing the raw title instead gave one Issue two names depending
         // on where you looked at it.
-        let listed = text(|buffer| list(buffer, &[issue(1, "   ", "Todo")], &Settled::default()));
+        let listed = text(|buffer| list(buffer, &[issue(1, "   ", "Todo")]));
         assert!(listed.contains("Untitled"), "{listed}");
 
         let mut blank = issue(1, "   ", "Todo");
@@ -353,7 +303,7 @@ mod tests {
 
     #[test]
     fn an_empty_list_says_so_rather_than_printing_a_header() {
-        let out = text(|buffer| list(buffer, &[], &Settled::default()));
+        let out = text(|buffer| list(buffer, &[]));
         assert_eq!(out, "No issues.\n");
     }
 
@@ -361,54 +311,34 @@ mod tests {
     fn a_parent_shows_progress_and_a_sub_issue_names_its_parent() {
         let mut parent = issue(1, "Ship the CLI", "Doing");
         parent.sub_issue_ids = vec![2, 3];
+        parent.settled_sub_issues = 1;
         let mut done = issue(2, "Parse arguments", "Done");
         done.parent_id = Some(1);
         let mut todo = issue(3, "Write the client", "Todo");
         todo.parent_id = Some(1);
 
-        let issues = vec![parent, done, todo];
-        let settled = Settled::from(&issues);
-        let out = text(|buffer| list(buffer, &issues, &settled));
+        let out = text(|buffer| list(buffer, &[parent, done, todo]));
 
         assert!(out.contains("Ship the CLI [1/2]"), "{out}");
         assert!(out.contains("↳ #1 Parse arguments"), "{out}");
     }
 
     #[test]
-    fn cancelled_counts_as_settled_for_progress() {
+    fn a_progress_fraction_survives_a_filter_that_hides_the_children() {
+        // The whole point of sending it: the parent alone is enough, where
+        // the CLI used to need a second request to get this right.
         let mut parent = issue(1, "p", "Todo");
-        parent.sub_issue_ids = vec![2];
-        let mut child = issue(2, "c", "Cancelled");
-        child.parent_id = Some(1);
+        parent.sub_issue_ids = vec![2, 3];
+        parent.settled_sub_issues = 1;
 
-        let issues = vec![parent, child];
-        let out = text(|buffer| list(buffer, &issues, &Settled::from(&issues)));
-        assert!(out.contains("[1/1]"), "{out}");
+        let out = text(|buffer| list(buffer, &[parent]));
+        assert!(out.contains("[1/2]"), "{out}");
     }
 
     #[test]
-    fn a_filtered_list_that_hides_a_child_is_detected() {
-        let mut parent = issue(1, "p", "Todo");
-        parent.sub_issue_ids = vec![2, 3];
-        // Only the parent came back; the fraction would be wrong.
-        let partial = vec![parent];
-        assert!(!Settled::from(&partial).covers(&partial));
-
-        let whole = vec![issue(2, "a", "Done"), issue(3, "b", "Todo")];
-        let mut both = whole;
-        both.extend(partial.iter().map(|issue| IssueJson {
-            id: issue.id,
-            title: issue.title.clone(),
-            body: String::new(),
-            status: issue.status.clone(),
-            priority: issue.priority.clone(),
-            tags: Vec::new(),
-            parent_id: None,
-            sub_issue_ids: issue.sub_issue_ids.clone(),
-            created_at: issue.created_at.clone(),
-            updated_at: issue.updated_at.clone(),
-        }));
-        assert!(Settled::from(&both).covers(&both));
+    fn an_issue_with_no_sub_issues_shows_no_fraction() {
+        let out = text(|buffer| list(buffer, &[issue(1, "alone", "Todo")]));
+        assert!(!out.contains("["), "{out}");
     }
 
     #[test]
@@ -417,7 +347,7 @@ mod tests {
         long.parent_id = Some(9);
         long.sub_issue_ids = vec![2];
 
-        let cell = title_cell(&long, &Settled::default());
+        let cell = title_cell(&long);
         assert_eq!(width(&cell), TITLE_WIDTH);
         assert!(cell.starts_with("↳ #9 "), "{cell}");
         assert!(cell.ends_with("[0/1]"), "{cell}");
@@ -445,8 +375,11 @@ mod tests {
 
     #[test]
     fn show_counts_outstanding_work_under_a_parent() {
+        // The count comes from the parent, as the API sent it — not from
+        // counting the children that happen to have been fetched.
         let mut parent = issue(1, "the parent", "Todo");
         parent.sub_issue_ids = vec![2, 3];
+        parent.settled_sub_issues = 1;
         let children = vec![issue(2, "done one", "Done"), issue(3, "not yet", "Todo")];
 
         let out = text(|buffer| show(buffer, &parent, None, &children));

@@ -262,14 +262,7 @@ fn json_body<T: DeserializeOwned>(request: &Request) -> Result<T, Response> {
 
 /// Renders an Issue together with the ids of its sub-issues.
 fn issue_json(projection: &Projection, issue: &Issue) -> IssueJson {
-    IssueJson::new(
-        issue,
-        projection
-            .sub_issues(issue.id)
-            .iter()
-            .map(|child| child.id)
-            .collect(),
-    )
+    IssueJson::new(issue, &projection.sub_issues(issue.id))
 }
 
 /// Turns the outcome of a mutation into a response.
@@ -678,6 +671,58 @@ mod tests {
         assert_eq!(json(&moved)["parent_id"], second);
         let old = send(&mut p, "GET", &format!("/issues/{first}"), "");
         assert_eq!(json(&old)["sub_issue_ids"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_parent_reports_how_much_of_it_is_settled() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        let done = make(&mut p, "done");
+        let cancelled = make(&mut p, "cancelled");
+        let outstanding = make(&mut p, "outstanding");
+        for child in [done, cancelled, outstanding] {
+            p.set_parent(child, Some(parent)).unwrap();
+        }
+        p.patch(done, IssuePatch::default().status(Status::Done))
+            .unwrap();
+        p.patch(cancelled, IssuePatch::default().status(Status::Cancelled))
+            .unwrap();
+
+        let response = send(&mut p, "GET", &format!("/issues/{parent}"), "");
+        // Both count as settled: one finished, the other was deliberately
+        // abandoned, and neither is waiting on anybody.
+        assert_eq!(json(&response)["settled_sub_issues"], 2);
+        assert_eq!(
+            json(&response)["sub_issue_ids"].as_array().unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn an_issue_with_no_sub_issues_reports_none_settled() {
+        let mut p = projection();
+        let lonely = make(&mut p, "lonely");
+        let response = send(&mut p, "GET", &format!("/issues/{lonely}"), "");
+        assert_eq!(json(&response)["settled_sub_issues"], 0);
+        assert_eq!(json(&response)["sub_issue_ids"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn a_narrowed_listing_still_carries_the_whole_fraction() {
+        // The reason this is on the wire at all: a filter that hides the
+        // children must not change the parent's fraction.
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        let child = make(&mut p, "child");
+        p.set_parent(child, Some(parent)).unwrap();
+        p.patch(child, IssuePatch::default().status(Status::Done))
+            .unwrap();
+
+        let listed = send(&mut p, "GET", "/issues?parent=none", "");
+        let issues = json(&listed);
+        assert_eq!(issues.as_array().unwrap().len(), 1, "the child is hidden");
+        assert_eq!(issues[0]["settled_sub_issues"], 1);
+        assert_eq!(issues[0]["sub_issue_ids"], serde_json::json!([child]));
     }
 
     #[test]

@@ -191,15 +191,7 @@ fn dispatch(
                 return emit(out, &issues);
             }
 
-            // A filter can hide a parent's children, which would make its
-            // progress fraction quietly wrong. One extra request fixes it; the
-            // unfiltered case never needs it.
-            let mut settled = render::Settled::from(&issues);
-            if !settled.covers(&issues) {
-                let everything: Vec<IssueJson> = decode(&ok(client.get("/issues")?)?)?;
-                settled = render::Settled::from(&everything);
-            }
-            render::list(out, &issues, &settled).map_err(broken_pipe)
+            render::list(out, &issues).map_err(broken_pipe)
         }
 
         Command::Show(id) => {

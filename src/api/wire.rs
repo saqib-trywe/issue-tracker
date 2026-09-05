@@ -26,6 +26,10 @@ pub struct IssueJson {
     pub parent_id: Option<IssueId>,
     /// Read-only, and in display order.
     pub sub_issue_ids: Vec<IssueId>,
+    /// How many of those are settled — Done or Cancelled. The total is
+    /// `sub_issue_ids.len()`, so only this half needs sending; two spellings
+    /// of one number is a thing that can disagree with itself.
+    pub settled_sub_issues: usize,
     pub created_at: String,
     /// Present from the first release so `If-Match` can be added later without
     /// changing the shape clients already parse.
@@ -33,11 +37,19 @@ pub struct IssueJson {
 }
 
 impl IssueJson {
-    /// Sub-issue ids come from the caller because an Issue does not know its
-    /// own children — that is a fact about the whole corpus.
-    pub fn new(issue: &Issue, sub_issue_ids: Vec<IssueId>) -> Self {
+    /// The children come from the caller because an Issue does not know its
+    /// own — that is a fact about the whole corpus.
+    ///
+    /// They arrive as Issues rather than as ids and a count, so the two
+    /// numbers that go out are derived from one slice and cannot contradict
+    /// each other.
+    pub fn new(issue: &Issue, sub_issues: &[&Issue]) -> Self {
         Self {
-            sub_issue_ids,
+            sub_issue_ids: sub_issues.iter().map(|child| child.id).collect(),
+            settled_sub_issues: sub_issues
+                .iter()
+                .filter(|child| child.status.is_settled())
+                .count(),
             parent_id: issue.parent_id,
             id: issue.id,
             title: issue.title.clone(),
@@ -202,12 +214,18 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let json = IssueJson::new(&issue, vec![9]);
+        let child = Issue {
+            id: 9,
+            status: Status::Done,
+            ..issue.clone()
+        };
+        let json = IssueJson::new(&issue, &[&child]);
         assert_eq!(json.status, "Cancelled");
         assert_eq!(json.priority, "Urgent");
         assert_eq!(json.tags, vec!["Bug".to_string()]);
         assert_eq!(json.parent_id, None);
         assert_eq!(json.sub_issue_ids, vec![9]);
+        assert_eq!(json.settled_sub_issues, 1);
         // Round-trips back through the same parser the store uses.
         assert_eq!(json.status.parse::<Status>().unwrap(), Status::Cancelled);
     }
