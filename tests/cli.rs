@@ -108,6 +108,14 @@ fn the_cli_end_to_end() {
     assert_eq!(failure.code(), 3);
     assert!(failure.message().contains("stale"), "{failure:?}");
 
+    // ---- an address file that cannot be read --------------------------------
+    // Present, so "not running" would be the wrong answer, but unusable — so
+    // this is a failure rather than an absence, and exits 1 rather than 3.
+    std::fs::write(dir.join("api.json"), "not json").expect("an unreadable address");
+    let failure = run("list").0.expect_err("the address cannot be parsed");
+    assert_eq!(failure.code(), 1, "unreadable is not the same as absent");
+    assert!(failure.message().contains("not readable"), "{failure:?}");
+
     // ---- a listing, and what went on the wire -------------------------------
     let (stub, port) = start(vec![(200, format!("[{ISSUE}]"))]);
     publish(&dir, port);
@@ -177,6 +185,85 @@ fn the_cli_end_to_end() {
         failure.message().contains("already applied: ui"),
         "{failure:?}"
     );
+
+    // ---- filing, and the body that goes with it -----------------------------
+    let (stub, port) = start(vec![(201, ISSUE.to_string()), (200, format!("[{ISSUE}]"))]);
+    publish(&dir, port);
+
+    let (outcome, printed) = run("new Ship-it --status doing --priority urgent --tag ui");
+    outcome.expect("a 201");
+    let sent = stub.seen.recv().expect("a request");
+    assert!(sent.starts_with("POST /issues "), "{sent}");
+    let body = sent.rsplit("\r\n\r\n").next().unwrap();
+    assert!(body.contains(r#""title":"Ship-it""#), "{body}");
+    assert!(body.contains(r#""status":"Doing""#), "case-folded: {body}");
+    assert!(body.contains(r#""priority":"Urgent""#), "{body}");
+    assert!(body.contains(r#""tags":["ui"]"#), "{body}");
+    // A patch names only what it changes, and creation is no different.
+    assert!(
+        !body.contains("null"),
+        "absent fields must be absent: {body}"
+    );
+    assert!(printed.contains("Fix the flash"), "{printed}");
+
+    // ---- showing an Issue names its neighbours ------------------------------
+    // At most three requests: the Issue, its parent, its children in one go.
+    let parent = ISSUE.replace(r#""id":7"#, r#""id":1"#);
+    let child = ISSUE
+        .replace(r#""id":7"#, r#""id":9"#)
+        .replace(r#""parent_id":null"#, r#""parent_id":7"#);
+    let family = ISSUE
+        .replace(r#""parent_id":null"#, r#""parent_id":1"#)
+        .replace(r#""sub_issue_ids":[]"#, r#""sub_issue_ids":[9]"#);
+    let (stub, port) = start(vec![
+        (200, family),
+        (200, parent),
+        (200, format!("[{child}]")),
+    ]);
+    publish(&dir, port);
+
+    let (outcome, printed) = run("show 7");
+    outcome.expect("a 200");
+    assert!(
+        stub.seen.recv().unwrap().starts_with("GET /issues/7 "),
+        "the Issue"
+    );
+    assert!(
+        stub.seen.recv().unwrap().starts_with("GET /issues/1 "),
+        "its parent"
+    );
+    let children = stub.seen.recv().unwrap();
+    assert!(
+        children.starts_with("GET /issues?parent=7 "),
+        "every child in one request: {children}"
+    );
+    assert!(printed.contains("Part of"), "{printed}");
+
+    // ---- the tag list ------------------------------------------------------
+    let (_stub, port) = start(vec![(200, r#"[{"name":"ui","count":3}]"#.into())]);
+    publish(&dir, port);
+    let (outcome, printed) = run("tags");
+    outcome.expect("a 200");
+    assert!(printed.contains("ui") && printed.contains("3"), "{printed}");
+
+    // ---- attaching sub-issues ----------------------------------------------
+    let (stub, port) = start(vec![(200, ISSUE.to_string()), (200, ISSUE.to_string())]);
+    publish(&dir, port);
+    run("sub add 7 9").0.expect("a 200");
+    let sent = stub.seen.recv().unwrap();
+    assert!(sent.starts_with("PUT /issues/7/sub-issues/9 "), "{sent}");
+
+    // ---- deleting is refused without a terminal, unless forced --------------
+    let failure = run("rm 7").0.expect_err("not a terminal");
+    assert_eq!(failure.code(), 2, "a bad invocation, not a failed request");
+    assert!(failure.message().contains("--force"), "{failure:?}");
+
+    let (stub, port) = start(vec![(204, String::new())]);
+    publish(&dir, port);
+    let (outcome, printed) = run("rm 7 --force");
+    outcome.expect("a 204");
+    assert!(stub.seen.recv().unwrap().starts_with("DELETE /issues/7 "));
+    assert!(printed.contains("Deleted #7"), "{printed}");
 
     std::fs::remove_dir_all(&dir).ok();
 }

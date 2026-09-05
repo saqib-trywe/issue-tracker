@@ -164,3 +164,98 @@ pub struct ChangeSubIssue {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NoArguments {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schemars::schema_for;
+    use serde_json::{from_value, json};
+
+    #[test]
+    fn a_status_is_read_the_way_every_other_entry_point_reads_one() {
+        let arg: StatusArg = from_value(json!("doing")).expect("case folds");
+        assert_eq!(arg.0, Status::Doing);
+        assert_eq!(
+            from_value::<StatusArg>(json!("CANCELLED")).unwrap().0,
+            Status::Cancelled
+        );
+    }
+
+    #[test]
+    fn an_unknown_status_names_the_ones_that_exist() {
+        let err = from_value::<StatusArg>(json!("Wontfix")).expect_err("not a status");
+        let message = err.to_string();
+        assert!(message.contains("Wontfix"), "{message}");
+        for status in Status::ALL {
+            assert!(message.contains(status.label()), "{message}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_priority_does_the_same() {
+        let err = from_value::<PriorityArg>(json!("Critical")).expect_err("not a priority");
+        let message = err.to_string();
+        assert!(message.contains("Critical"), "{message}");
+        assert!(message.contains("Urgent"), "{message}");
+    }
+
+    /// The schema is built from `Status::ALL`, so what an agent is offered
+    /// cannot drift from what the tracker accepts.
+    #[test]
+    fn the_schema_offers_the_domains_own_list() {
+        let schema = serde_json::to_value(schema_for!(StatusArg)).unwrap();
+        let offered: Vec<String> = from_value(schema["enum"].clone()).expect("an enum");
+        let domain: Vec<String> = Status::ALL
+            .iter()
+            .map(|status| status.label().to_string())
+            .collect();
+        assert_eq!(offered, domain);
+
+        let schema = serde_json::to_value(schema_for!(PriorityArg)).unwrap();
+        let offered: Vec<String> = from_value(schema["enum"].clone()).expect("an enum");
+        let domain: Vec<String> = Priority::ALL
+            .iter()
+            .map(|priority| priority.label().to_string())
+            .collect();
+        assert_eq!(offered, domain);
+    }
+
+    /// Without `deny_unknown_fields`, `update_issue` with a `tags` field would
+    /// report success and change nothing — the trap `pico-args` sets for the
+    /// command line, in a different costume.
+    #[test]
+    fn an_argument_we_were_never_asked_for_is_refused() {
+        let err = from_value::<UpdateIssue>(json!({ "id": 1, "tags": ["ui"] }))
+            .expect_err("tags is not patchable");
+        assert!(err.to_string().contains("tags"), "{err}");
+
+        let err =
+            from_value::<UpdateIssue>(json!({ "id": 1, "statuss": "Done" })).expect_err("a typo");
+        assert!(err.to_string().contains("statuss"), "{err}");
+
+        let err = from_value::<ListIssues>(json!({ "limit": 10 })).expect_err("no limit exists");
+        assert!(err.to_string().contains("limit"), "{err}");
+    }
+
+    #[test]
+    fn every_listing_argument_is_optional() {
+        let empty: ListIssues = from_value(json!({})).expect("all optional");
+        assert!(empty.status.is_none());
+        assert!(empty.tag.is_none());
+        assert!(empty.parent.is_none());
+        assert!(empty.search.is_none());
+
+        // `list_tags` takes nothing at all, and must accept being sent nothing.
+        from_value::<NoArguments>(json!({})).expect("no arguments");
+    }
+
+    #[test]
+    fn creating_needs_only_a_title() {
+        let minimal: CreateIssue = from_value(json!({ "title": "Ship it" })).expect("just a title");
+        assert_eq!(minimal.title, "Ship it");
+        assert!(minimal.parent_id.is_none());
+        assert!(minimal.tags.is_none());
+
+        from_value::<CreateIssue>(json!({})).expect_err("a title is required");
+    }
+}

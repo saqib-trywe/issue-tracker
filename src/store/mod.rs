@@ -278,6 +278,45 @@ mod tests {
         Store::open_in_memory().expect("in-memory store")
     }
 
+    /// Every other test here runs in memory, so nothing exercised the path
+    /// the application actually takes: a file that does not exist yet, with
+    /// the migrations run against it from scratch, and the data still there
+    /// when it is reopened.
+    #[test]
+    fn a_store_on_disk_is_created_migrated_and_reopened() {
+        let dir = std::env::temp_dir().join(format!("issue-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("issues.db");
+
+        let id = {
+            let store = Store::open_at(&path).expect("a fresh file");
+            let issue = store.insert("survives a restart").expect("insert");
+            store
+                .set_setting(settings_keys::UI_VIEW, "Doing")
+                .expect("a setting");
+            issue.id
+        };
+        assert!(path.exists(), "the file was created");
+
+        // Reopened: the migration runner must be a no-op the second time, and
+        // everything written must still be there.
+        let store = Store::open_at(&path).expect("an existing file");
+        let issues = store.load_all().expect("load");
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].id, id);
+        assert_eq!(issues[0].title, "survives a restart");
+        assert_eq!(
+            store
+                .get_setting(settings_keys::UI_VIEW)
+                .unwrap()
+                .as_deref(),
+            Some("Doing")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_new_store_is_empty() {
         assert!(store().load_all().unwrap().is_empty());

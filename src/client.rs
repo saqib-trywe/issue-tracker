@@ -213,6 +213,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_error_says_only_what_the_transport_can_tell_apart() {
+        // Whether there was an app to talk to. What a caller does about it —
+        // an exit code, a tool error — is the caller's business.
+        let gone = ClientError::not_running("Issues is not running.");
+        assert_eq!(gone.message(), "Issues is not running.");
+        assert_eq!(gone.to_string(), "Issues is not running.");
+        assert_eq!(
+            ClientError::failed("the socket closed").message(),
+            "the socket closed"
+        );
+        assert_ne!(gone, ClientError::failed("Issues is not running."));
+    }
+
+    #[test]
     fn a_reply_is_split_at_the_blank_line() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
         let reply = parse_reply(raw).unwrap();

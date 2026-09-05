@@ -202,6 +202,39 @@ mod tests {
         );
     }
 
+    /// What seeds the picker's selection from the persisted name. A wrong
+    /// answer here shows the right theme applied with the wrong row ticked.
+    #[test]
+    fn a_stored_name_finds_its_row_in_the_picker() {
+        let catalogue = ThemeCatalogue::load();
+        let light = catalogue.for_mode(ThemeMode::Light).to_vec();
+        let names: Vec<String> = light.iter().map(|choice| choice.name.to_string()).collect();
+        let delegate = ThemeListDelegate::new(light);
+
+        let wanted = "Gruvbox Light";
+        let found = delegate.index_of(wanted).expect("a vendored light theme");
+        assert_eq!(names[found.row], wanted);
+
+        assert!(
+            delegate.index_of("No Such Theme").is_none(),
+            "an unknown name leaves the picker unset rather than pointing at row 0"
+        );
+    }
+
+    #[test]
+    fn a_theme_is_identified_by_the_name_that_is_persisted() {
+        // Title and value are the same string on purpose: the stored value
+        // survives the catalogue being reordered.
+        let catalogue = ThemeCatalogue::load();
+        let choice = catalogue
+            .find(ThemeMode::Dark, "Gruvbox Dark")
+            .expect("a vendored dark theme")
+            .clone();
+
+        assert_eq!(choice.title(), "Gruvbox Dark");
+        assert_eq!(choice.value().as_ref(), "Gruvbox Dark");
+    }
+
     #[test]
     fn known_themes_resolve_by_name() {
         let catalogue = ThemeCatalogue::load();

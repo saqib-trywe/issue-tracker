@@ -499,3 +499,140 @@ fn stream(colour: Colour) -> StandardStream {
     };
     StandardStream::stdout(choice)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Tag, View};
+
+    fn tag(name: &str) -> Tag {
+        name.parse().expect("a usable tag")
+    }
+
+    /// The help text is built from `Status::ALL`/`Priority::ALL` because a
+    /// hardcoded list had already drifted from the domain once — it offered a
+    /// priority called "Normal", which has never existed.
+    #[test]
+    fn the_help_text_offers_exactly_what_the_domain_accepts() {
+        let help = help();
+        for status in Status::ALL {
+            assert!(help.contains(status.label()), "{}", status.label());
+        }
+        for priority in Priority::ALL {
+            assert!(help.contains(priority.label()), "{}", priority.label());
+        }
+        assert!(!help.contains("Normal"), "the label that never existed");
+    }
+
+    #[test]
+    fn an_absent_status_filter_is_the_view_that_admits_everything() {
+        let narrowed = narrowing(Filters::default());
+        assert_eq!(narrowed.view, View::All);
+        assert_eq!(narrowed, Narrowing::default());
+    }
+
+    #[test]
+    fn each_filter_reaches_the_narrowing() {
+        let narrowed = narrowing(Filters {
+            status: Some(Status::Doing),
+            tag: Some(tag("ui")),
+            search: Some("flash".into()),
+            parent: Some(ParentFilter::Unparented),
+        });
+
+        assert_eq!(narrowed.view, View::WithStatus(Status::Doing));
+        assert_eq!(narrowed.tag, Some(tag("ui")));
+        assert_eq!(narrowed.title.as_deref(), Some("flash"));
+        assert_eq!(narrowed.parent, Some(ParentFilter::Unparented));
+    }
+
+    #[test]
+    fn a_new_issue_carries_only_what_was_asked_for() {
+        let body = new_issue(NewIssue {
+            title: "Ship it".into(),
+            body: Some(Body::Text("notes".into())),
+            status: Some(Status::Doing),
+            priority: Some(Priority::High),
+            tags: vec![tag("ui")],
+            parent: Some(3),
+        })
+        .expect("no stdin needed");
+
+        assert_eq!(body.title, "Ship it");
+        assert_eq!(body.parent_id, Some(3));
+        assert_eq!(body.rest.body.as_deref(), Some("notes"));
+        assert_eq!(body.rest.status.as_deref(), Some("Doing"));
+        assert_eq!(body.rest.priority.as_deref(), Some("High"));
+        assert_eq!(body.rest.tags, Some(vec!["ui".to_string()]));
+    }
+
+    #[test]
+    fn no_tags_says_nothing_about_tags_rather_than_clearing_them() {
+        // `PATCH {tags: []}` clears the set, so an absent `--tag` must not
+        // serialise as an empty list.
+        let body = new_issue(NewIssue {
+            title: "Bare".into(),
+            body: None,
+            status: None,
+            priority: None,
+            tags: Vec::new(),
+            parent: None,
+        })
+        .expect("no stdin needed");
+
+        assert_eq!(body.rest.tags, None);
+        assert_eq!(body.rest.status, None);
+        assert_eq!(body.parent_id, None);
+    }
+
+    #[test]
+    fn a_patch_names_only_the_fields_that_were_given() {
+        let changed = patch(Changes {
+            title: None,
+            body: None,
+            status: Some(Status::Cancelled),
+            priority: None,
+        })
+        .expect("no stdin needed");
+
+        assert_eq!(changed.status.as_deref(), Some("Cancelled"));
+        assert_eq!(changed.title, None);
+        assert_eq!(changed.body, None);
+        assert_eq!(changed.priority, None);
+        // The field that exists only to be rejected must never be sent.
+        assert!(changed.parent_id.is_none());
+    }
+
+    #[test]
+    fn an_empty_change_set_produces_an_empty_patch() {
+        let changed = patch(Changes::default()).expect("no stdin needed");
+        assert_eq!(serde_json::to_string(&changed).unwrap(), "{}");
+    }
+
+    #[test]
+    fn a_literal_body_needs_no_stdin() {
+        assert_eq!(
+            read_body(Body::Text("written out".into())).unwrap(),
+            "written out"
+        );
+    }
+
+    #[test]
+    fn the_exit_codes_are_the_ones_a_wrapper_branches_on() {
+        assert_eq!(Failure::usage("x").code(), 2);
+        assert_eq!(Failure::failed("x").code(), 1);
+        assert_eq!(Failure::not_running("x").code(), 3);
+        assert_eq!(Failure::failed("why").message(), "why");
+
+        // The client knows only whether there was an app to talk to; the exit
+        // code is the CLI's business.
+        assert_eq!(
+            Failure::from(ClientError::NotRunning("gone".into())),
+            Failure::NotRunning("gone".into())
+        );
+        assert_eq!(
+            Failure::from(ClientError::Failed("broke".into())),
+            Failure::Failed("broke".into())
+        );
+    }
+}
