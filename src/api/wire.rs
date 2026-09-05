@@ -80,13 +80,17 @@ pub struct TagJson {
 /// `POST /issues`. Only the title is required; everything else is applied in
 /// the same call so automation never needs two round-trips to file a
 /// fully-specified Issue.
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` because this is also what the clients build: `operations`
+/// constructs one and sends it, so the shape of a create body is defined once,
+/// by the side that has to parse it.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct NewIssue {
     pub title: String,
     /// Accepted at creation, where "absent" unambiguously means "no parent" —
     /// the ambiguity that keeps it out of `PATCH` does not arise here, and
     /// filing a sub-issue should not need two calls. See `docs/adr/0007`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<IssueId>,
     #[serde(flatten)]
     pub rest: PatchIssue,
@@ -94,23 +98,27 @@ pub struct NewIssue {
 
 /// `PATCH /issues/{id}`. An absent field is left alone; this is what stops a
 /// caller setting a Status from rewriting a title someone else is editing.
-#[derive(Debug, Default, Deserialize)]
+///
+/// Every field skips serialising when absent. Without that, a patch built by
+/// a client would send `"title": null` for a field it does not touch, and
+/// "names only what it changes" would be true only by accident.
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct PatchIssue {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
     /// Present only so it can be *rejected* with a pointer to the right
     /// endpoint. Typed as a raw value because `Option<IssueId>` cannot tell an
     /// absent key from an explicit `null`, and silently ignoring an attempted
     /// re-parent would be a trap.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<serde_json::Value>,
 }
 

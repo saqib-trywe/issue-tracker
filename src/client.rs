@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::operations::Call;
 use crate::store;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -122,27 +123,11 @@ pub fn connect() -> Result<Client, ClientError> {
 }
 
 impl Client {
-    pub fn get(&self, path: &str) -> Result<Reply, ClientError> {
-        self.send("GET", path, None)
-    }
-
-    pub fn post(&self, path: &str, body: &str) -> Result<Reply, ClientError> {
-        self.send("POST", path, Some(body))
-    }
-
-    pub fn patch(&self, path: &str, body: &str) -> Result<Reply, ClientError> {
-        self.send("PATCH", path, Some(body))
-    }
-
-    pub fn put(&self, path: &str) -> Result<Reply, ClientError> {
-        self.send("PUT", path, None)
-    }
-
-    pub fn delete(&self, path: &str) -> Result<Reply, ClientError> {
-        self.send("DELETE", path, None)
-    }
-
-    fn send(&self, method: &str, path: &str, body: Option<&str>) -> Result<Reply, ClientError> {
+    /// Performs one [`Call`]. The only way to reach the API — which is what
+    /// makes `operations` the only place that decides what a request looks
+    /// like, rather than merely the tidiest.
+    pub fn send(&self, call: &Call) -> Result<Reply, ClientError> {
+        let (method, path, body) = (call.method.name(), call.path.as_str(), call.method.body());
         let mut stream = TcpStream::connect_timeout(&self.address, TIMEOUT).map_err(|err| {
             // A published address that nothing answers means the app died
             // without cleaning up. Same remedy, so same exit code — but the
@@ -201,28 +186,6 @@ impl Client {
         }
         head.into_bytes()
     }
-}
-
-/// Percent-encodes a path segment or query value.
-///
-/// Tag names may hold slashes, and the API reads the whole path remainder as
-/// the name — so in a path a slash is passed through, while in a query value
-/// it is not. It lives here rather than with either caller because that rule
-/// is a fact about the API, and two clients encoding it differently would
-/// disagree about which Tag they meant.
-pub fn encode(raw: &str, path_segment: bool) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for byte in raw.bytes() {
-        let safe = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-            || (path_segment && byte == b'/');
-        if safe {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 fn parse_reply(raw: &[u8]) -> Result<Reply, ClientError> {

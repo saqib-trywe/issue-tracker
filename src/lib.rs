@@ -14,5 +14,6 @@ pub mod api;
 pub mod cli;
 pub mod client;
 pub mod domain;
+pub mod operations;
 pub mod projection;
 pub mod store;

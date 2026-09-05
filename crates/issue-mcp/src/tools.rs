@@ -10,15 +10,17 @@
 //!
 //! There is deliberately no `delete_issue`. See `docs/adr/0009`.
 
-use issue_tracker::client::encode;
+use issue_tracker::api::wire::{NewIssue, PatchIssue};
+use issue_tracker::domain::{Narrowing, ParentFilter, Tag, View};
+use issue_tracker::operations;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
-use crate::api::{self, Method};
+use crate::api;
 use crate::args::*;
 
 /// Sent to the agent once, at initialize, before any tool is called.
@@ -58,26 +60,30 @@ impl Issues {
     /// read one. Every filter is optional and they combine.
     #[tool(annotations(read_only_hint = true))]
     async fn list_issues(&self, Parameters(args): Parameters<ListIssues>) -> CallToolResult {
-        let mut query: Vec<String> = Vec::new();
-        if let Some(status) = args.status {
-            query.push(format!("status={}", encode(status.0.label(), false)));
-        }
-        if let Some(tag) = &args.tag {
-            query.push(format!("tag={}", encode(tag, false)));
-        }
-        if let Some(parent) = &args.parent {
-            query.push(format!("parent={}", encode(parent, false)));
-        }
-        if let Some(search) = &args.search {
-            query.push(format!("q={}", encode(search, false)));
-        }
-
-        let path = match query.is_empty() {
-            true => "/issues".to_string(),
-            false => format!("/issues?{}", query.join("&")),
+        // `parent` arrives as a string because "none" is one of its values;
+        // parsing it here means a typo is a tool error rather than a 400.
+        let parent = match args.parent.as_deref().map(str::parse::<ParentFilter>) {
+            Some(Ok(parent)) => Some(parent),
+            Some(Err(err)) => return failed(format!("{err} — use an issue id or \"none\"")),
+            None => None,
+        };
+        let narrowing = Narrowing {
+            view: match args.status {
+                Some(status) => View::WithStatus(status.0),
+                None => View::All,
+            },
+            tag: args
+                .tag
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .ok()
+                .flatten(),
+            title: args.search,
+            parent,
         };
 
-        match api::send(Method::Get, path).await {
+        match api::send(operations::list(&narrowing)).await {
             // Listing is for finding; reading is for reading. A tracker's
             // bodies are the bulk of it, and an agent that wants one knows
             // the id by the time it does.
@@ -90,25 +96,24 @@ impl Issues {
     /// the ids of its sub-issues.
     #[tool(annotations(read_only_hint = true))]
     async fn get_issue(&self, Parameters(args): Parameters<GetIssue>) -> CallToolResult {
-        respond(Method::Get, format!("/issues/{}", args.id)).await
+        respond(operations::get(args.id)).await
     }
 
     /// File a new issue. Only the title is required.
     #[tool]
     async fn create_issue(&self, Parameters(args): Parameters<CreateIssue>) -> CallToolResult {
-        let mut body = Map::new();
-        body.insert("title".into(), json!(args.title));
-        insert_if_some(&mut body, "body", args.body.map(Value::from));
-        insert_if_some(&mut body, "status", label(args.status));
-        insert_if_some(&mut body, "priority", priority_label(args.priority));
-        insert_if_some(&mut body, "tags", args.tags.map(Value::from));
-        insert_if_some(&mut body, "parent_id", args.parent_id.map(Value::from));
-
-        respond(
-            Method::Post(Value::Object(body).to_string()),
-            "/issues".into(),
-        )
-        .await
+        let new = NewIssue {
+            title: args.title,
+            parent_id: args.parent_id,
+            rest: PatchIssue {
+                body: args.body,
+                status: args.status.map(|status| status.0.label().to_string()),
+                priority: args.priority.map(|priority| priority.0.label().to_string()),
+                tags: args.tags,
+                ..Default::default()
+            },
+        };
+        respond(operations::create(&new)).await
     }
 
     /// Change an issue's title, body, status or priority. A field left out is
@@ -117,17 +122,14 @@ impl Issues {
     /// remove_sub_issue exist to change one thing at a time.
     #[tool]
     async fn update_issue(&self, Parameters(args): Parameters<UpdateIssue>) -> CallToolResult {
-        let mut body = Map::new();
-        insert_if_some(&mut body, "title", args.title.map(Value::from));
-        insert_if_some(&mut body, "body", args.body.map(Value::from));
-        insert_if_some(&mut body, "status", label(args.status));
-        insert_if_some(&mut body, "priority", priority_label(args.priority));
-
-        respond(
-            Method::Patch(Value::Object(body).to_string()),
-            format!("/issues/{}", args.id),
-        )
-        .await
+        let patch = PatchIssue {
+            title: args.title,
+            body: args.body,
+            status: args.status.map(|status| status.0.label().to_string()),
+            priority: args.priority.map(|priority| priority.0.label().to_string()),
+            ..Default::default()
+        };
+        respond(operations::update(args.id, &patch)).await
     }
 
     /// Attach a tag to an issue. Adding a tag it already carries is not an
@@ -135,21 +137,27 @@ impl Issues {
     /// spelling is kept.
     #[tool(annotations(idempotent_hint = true))]
     async fn add_tag(&self, Parameters(args): Parameters<ChangeTag>) -> CallToolResult {
-        respond(Method::Put, tag_path(args.id, &args.name)).await
+        match args.name.parse::<Tag>() {
+            Ok(tag) => respond(operations::add_tag(args.id, &tag)).await,
+            Err(err) => failed(err.to_string()),
+        }
     }
 
     /// Remove a tag from an issue. Removing one it does not carry is not an
     /// error. A tag that no issue carries ceases to exist.
     #[tool(annotations(idempotent_hint = true))]
     async fn remove_tag(&self, Parameters(args): Parameters<ChangeTag>) -> CallToolResult {
-        respond(Method::Delete, tag_path(args.id, &args.name)).await
+        match args.name.parse::<Tag>() {
+            Ok(tag) => respond(operations::remove_tag(args.id, &tag)).await,
+            Err(err) => failed(err.to_string()),
+        }
     }
 
     /// Make one issue a sub-issue of another. An issue that is already a
     /// sub-issue of something else is moved rather than copied.
     #[tool(annotations(idempotent_hint = true))]
     async fn add_sub_issue(&self, Parameters(args): Parameters<ChangeSubIssue>) -> CallToolResult {
-        respond(Method::Put, sub_issue_path(&args)).await
+        respond(operations::add_sub_issue(args.parent_id, args.sub_issue_id)).await
     }
 
     /// Detach a sub-issue from its parent. It survives as an ordinary issue.
@@ -158,13 +166,17 @@ impl Issues {
         &self,
         Parameters(args): Parameters<ChangeSubIssue>,
     ) -> CallToolResult {
-        respond(Method::Delete, sub_issue_path(&args)).await
+        respond(operations::remove_sub_issue(
+            args.parent_id,
+            args.sub_issue_id,
+        ))
+        .await
     }
 
     /// List every tag in use, with the number of issues carrying it.
     #[tool(annotations(read_only_hint = true))]
     async fn list_tags(&self, Parameters(_): Parameters<NoArguments>) -> CallToolResult {
-        match api::send(Method::Get, "/tags".into()).await {
+        match api::send(operations::tags()).await {
             Ok(tags) => ok(json!({ "tags": tags })),
             Err(message) => failed(message),
         }
@@ -186,8 +198,8 @@ impl ServerHandler for Issues {
 
 // ---- helpers ----------------------------------------------------------------
 
-async fn respond(method: Method, path: String) -> CallToolResult {
-    match api::send(method, path).await {
+async fn respond(call: operations::Call) -> CallToolResult {
+    match api::send(call).await {
         Ok(value) => ok(value),
         Err(message) => failed(message),
     }
@@ -203,32 +215,6 @@ fn ok(value: Value) -> CallToolResult {
 /// — so a tool error, not a protocol error.
 fn failed(message: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(message)])
-}
-
-fn insert_if_some(body: &mut Map<String, Value>, key: &str, value: Option<Value>) {
-    if let Some(value) = value {
-        body.insert(key.to_string(), value);
-    }
-}
-
-fn label(status: Option<StatusArg>) -> Option<Value> {
-    status.map(|status| Value::from(status.0.label()))
-}
-
-fn priority_label(priority: Option<PriorityArg>) -> Option<Value> {
-    priority.map(|priority| Value::from(priority.0.label()))
-}
-
-/// A Tag name is the whole path remainder, slashes and all.
-fn tag_path(id: i64, name: &str) -> String {
-    format!("/issues/{id}/tags/{}", encode(name, true))
-}
-
-fn sub_issue_path(args: &ChangeSubIssue) -> String {
-    format!(
-        "/issues/{}/sub-issues/{}",
-        args.parent_id, args.sub_issue_id
-    )
 }
 
 /// Drops `body` from every issue in a list.
@@ -257,14 +243,6 @@ fn without_bodies(issues: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_tag_name_keeps_its_slashes_but_loses_its_spaces() {
-        // The API reads everything after `/tags/` as the name, so a slash
-        // must survive; a space must not.
-        assert_eq!(tag_path(3, "ui/theme"), "/issues/3/tags/ui/theme");
-        assert_eq!(tag_path(3, "needs design"), "/issues/3/tags/needs%20design");
-    }
 
     #[test]
     fn listing_drops_bodies_and_nothing_else() {

@@ -14,13 +14,13 @@ mod render;
 use std::ffi::OsString;
 use std::io::{IsTerminal, Read, Write};
 
-use serde_json::json;
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 
-use crate::api::wire::{IssueJson, TagJson};
-use crate::domain::{IssueId, ParentFilter, Priority, Status};
+use crate::api::wire::{IssueJson, NewIssue as NewIssueBody, PatchIssue, TagJson};
+use crate::domain::{IssueId, Narrowing, ParentFilter, Priority, Status, View};
 
-use crate::client::{self, Client, ClientError, Reply, encode};
+use crate::client::{self, Client, ClientError, Reply};
+use crate::operations::{self, Call};
 use args::{Body, Changes, Colour, Command, Filters, NewIssue};
 
 /// Built from the domain rather than written out, so the list of statuses can
@@ -185,7 +185,7 @@ fn dispatch(
         Command::Help | Command::Version => unreachable!("handled before connecting"),
 
         Command::List(filters) => {
-            let reply = client.get(&list_path(&filters))?;
+            let reply = client.send(&operations::list(&narrowing(filters)))?;
             let issues: Vec<IssueJson> = decode(&ok(reply)?)?;
             if json_only {
                 return emit(out, &issues);
@@ -195,7 +195,7 @@ fn dispatch(
         }
 
         Command::Show(id) => {
-            let reply = ok(client.get(&format!("/issues/{id}"))?)?;
+            let reply = ok(client.send(&operations::get(id))?)?;
             if json_only {
                 return raw(out, &reply);
             }
@@ -204,7 +204,7 @@ fn dispatch(
         }
 
         Command::New(new) => {
-            let reply = ok(client.post("/issues", &create_body(*new)?)?)?;
+            let reply = ok(client.send(&operations::create(&new_issue(*new)?))?)?;
             if json_only {
                 return raw(out, &reply);
             }
@@ -213,7 +213,7 @@ fn dispatch(
         }
 
         Command::Set(id, changes) => {
-            let reply = ok(client.patch(&format!("/issues/{id}"), &patch_body(*changes)?)?)?;
+            let reply = ok(client.send(&operations::update(id, &patch(*changes)?))?)?;
             if json_only {
                 return raw(out, &reply);
             }
@@ -224,7 +224,7 @@ fn dispatch(
         Command::Remove { id, force } => remove(client, out, id, force),
 
         Command::Tags => {
-            let reply = ok(client.get("/tags")?)?;
+            let reply = ok(client.send(&operations::tags())?)?;
             if json_only {
                 return raw(out, &reply);
             }
@@ -233,29 +233,31 @@ fn dispatch(
         }
 
         Command::Tag { id, names, add } => {
-            let paths: Vec<(String, String)> = names
+            let calls: Vec<(String, Call)> = names
                 .iter()
                 .map(|tag| {
-                    (
-                        tag.as_str().to_string(),
-                        format!("/issues/{id}/tags/{}", encode(tag.as_str(), true)),
-                    )
+                    let call = match add {
+                        true => operations::add_tag(id, tag),
+                        false => operations::remove_tag(id, tag),
+                    };
+                    (tag.as_str().to_string(), call)
                 })
                 .collect();
-            each(client, out, json_only, add, paths)
+            each(client, out, json_only, add, calls)
         }
 
         Command::Sub { id, children, add } => {
-            let paths: Vec<(String, String)> = children
+            let calls: Vec<(String, Call)> = children
                 .iter()
                 .map(|child| {
-                    (
-                        format!("#{child}"),
-                        format!("/issues/{id}/sub-issues/{child}"),
-                    )
+                    let call = match add {
+                        true => operations::add_sub_issue(id, *child),
+                        false => operations::remove_sub_issue(id, *child),
+                    };
+                    (format!("#{child}"), call)
                 })
                 .collect();
-            each(client, out, json_only, add, paths)
+            each(client, out, json_only, add, calls)
         }
     }
 }
@@ -270,21 +272,17 @@ fn each(
     out: &mut dyn WriteColor,
     json_only: bool,
     add: bool,
-    paths: Vec<(String, String)>,
+    calls: Vec<(String, Call)>,
 ) -> Result<(), Failure> {
-    if paths.is_empty() {
+    if calls.is_empty() {
         return Err(Failure::usage("nothing to add or remove"));
     }
 
     let mut applied: Vec<String> = Vec::new();
     let mut last = None;
 
-    for (name, path) in paths {
-        let reply = if add {
-            client.put(&path)?
-        } else {
-            client.delete(&path)?
-        };
+    for (name, call) in calls {
+        let reply = client.send(&call)?;
         match ok(reply) {
             Ok(reply) => {
                 applied.push(name);
@@ -325,7 +323,7 @@ fn remove(
     // happens to its sub-issues — the one thing about deleting that surprises
     // people. `--force` skips both the prompt and the request.
     if !force && std::io::stdin().is_terminal() {
-        let issue: IssueJson = decode(&ok(client.get(&format!("/issues/{id}"))?)?)?;
+        let issue: IssueJson = decode(&ok(client.send(&operations::get(id))?)?)?;
         let released = match issue.sub_issue_ids.len() {
             0 => String::new(),
             1 => " Its 1 sub-issue will be kept, no longer part of anything.".to_string(),
@@ -352,7 +350,7 @@ fn remove(
         ));
     }
 
-    ok(client.delete(&format!("/issues/{id}"))?)?;
+    ok(client.send(&operations::delete(id))?)?;
     writeln!(out, "Deleted #{id}.").map_err(broken_pipe)
 }
 
@@ -364,14 +362,18 @@ fn remove(
 fn present(client: &Client, out: &mut dyn WriteColor, issue: &IssueJson) -> Result<(), Failure> {
     let parent = match issue.parent_id {
         Some(parent) => Some(decode::<IssueJson>(&ok(
-            client.get(&format!("/issues/{parent}"))?
+            client.send(&operations::get(parent))?
         )?)?),
         None => None,
     };
     let children: Vec<IssueJson> = if issue.sub_issue_ids.is_empty() {
         Vec::new()
     } else {
-        decode(&ok(client.get(&format!("/issues?parent={}", issue.id))?)?)?
+        let children = Narrowing {
+            parent: Some(ParentFilter::Under(issue.id)),
+            ..Default::default()
+        };
+        decode(&ok(client.send(&operations::list(&children))?)?)?
     };
 
     render::show(out, issue, parent.as_ref(), &children).map_err(broken_pipe)
@@ -379,68 +381,53 @@ fn present(client: &Client, out: &mut dyn WriteColor, issue: &IssueJson) -> Resu
 
 // ---- request and response plumbing ------------------------------------------
 
-fn list_path(filters: &Filters) -> String {
-    let mut query: Vec<String> = Vec::new();
-    if let Some(status) = filters.status {
-        query.push(format!("status={}", status.label()));
-    }
-    if let Some(tag) = &filters.tag {
-        query.push(format!("tag={}", encode(tag.as_str(), false)));
-    }
-    if let Some(search) = &filters.search {
-        query.push(format!("q={}", encode(search, false)));
-    }
-    match filters.parent {
-        Some(ParentFilter::Unparented) => query.push("parent=none".to_string()),
-        Some(ParentFilter::Under(id)) => query.push(format!("parent={id}")),
-        None => {}
-    }
-
-    if query.is_empty() {
-        "/issues".to_string()
-    } else {
-        format!("/issues?{}", query.join("&"))
+/// The command line's filters, as the narrowing every surface shares.
+///
+/// `--status` absent is not a filter to remember later: it is the View that
+/// admits everything.
+fn narrowing(filters: Filters) -> Narrowing {
+    Narrowing {
+        view: match filters.status {
+            Some(status) => View::WithStatus(status),
+            None => View::All,
+        },
+        tag: filters.tag,
+        title: filters.search,
+        parent: filters.parent,
     }
 }
 
-fn create_body(new: NewIssue) -> Result<String, Failure> {
-    let mut body = json!({ "title": new.title });
-    let map = body.as_object_mut().expect("an object");
-    if let Some(source) = new.body {
-        map.insert("body".into(), json!(read_body(source)?));
-    }
-    if let Some(status) = new.status {
-        map.insert("status".into(), json!(status.label()));
-    }
-    if let Some(priority) = new.priority {
-        map.insert("priority".into(), json!(priority.label()));
-    }
-    if !new.tags.is_empty() {
-        let tags: Vec<&str> = new.tags.iter().map(|tag| tag.as_str()).collect();
-        map.insert("tags".into(), json!(tags));
-    }
-    if let Some(parent) = new.parent {
-        map.insert("parent_id".into(), json!(parent));
-    }
-    Ok(body.to_string())
+/// Stdin is resolved here rather than inside `operations`, so that building a
+/// request stays a pure function.
+fn new_issue(new: NewIssue) -> Result<NewIssueBody, Failure> {
+    Ok(NewIssueBody {
+        title: new.title,
+        parent_id: new.parent,
+        rest: PatchIssue {
+            body: new.body.map(read_body).transpose()?,
+            status: new.status.map(|status| status.label().to_string()),
+            priority: new.priority.map(|priority| priority.label().to_string()),
+            // An empty `--tag` list means "say nothing about tags", not
+            // "clear them" — clearing is what `tag rm` is for.
+            tags: match new.tags.is_empty() {
+                true => None,
+                false => Some(new.tags.iter().map(|tag| tag.as_str().to_owned()).collect()),
+            },
+            ..Default::default()
+        },
+    })
 }
 
-fn patch_body(changes: Changes) -> Result<String, Failure> {
-    let mut body = json!({});
-    let map = body.as_object_mut().expect("an object");
-    if let Some(title) = changes.title {
-        map.insert("title".into(), json!(title));
-    }
-    if let Some(source) = changes.body {
-        map.insert("body".into(), json!(read_body(source)?));
-    }
-    if let Some(status) = changes.status {
-        map.insert("status".into(), json!(status.label()));
-    }
-    if let Some(priority) = changes.priority {
-        map.insert("priority".into(), json!(priority.label()));
-    }
-    Ok(body.to_string())
+fn patch(changes: Changes) -> Result<PatchIssue, Failure> {
+    Ok(PatchIssue {
+        title: changes.title,
+        body: changes.body.map(read_body).transpose()?,
+        status: changes.status.map(|status| status.label().to_string()),
+        priority: changes
+            .priority
+            .map(|priority| priority.label().to_string()),
+        ..Default::default()
+    })
 }
 
 fn read_body(source: Body) -> Result<String, Failure> {
