@@ -11,6 +11,7 @@ pub mod api_server;
 mod issue_detail;
 mod issue_list;
 pub mod menus;
+mod preferences;
 mod sidebar;
 mod tag_colour;
 mod theme;

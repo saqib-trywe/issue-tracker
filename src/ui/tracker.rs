@@ -19,11 +19,11 @@ use gpui_component::combobox::{ComboboxEvent, ComboboxState};
 use gpui_component::searchable_list::SearchableVec;
 use gpui_component::select::{SelectEvent, SelectState};
 
+use super::preferences::Preferences;
 use super::theme_catalogue::{ThemeCatalogue, ThemeListDelegate};
 use super::working_state::WorkingState;
 use issue_tracker::domain::{Issue, IssueId, Priority, Status, Tag, View};
 use issue_tracker::projection::{IssuePatch, Projection, Written};
-use issue_tracker::store::settings_keys;
 
 /// The Tag editor in the detail pane. Tags are plain names, so the delegate is
 /// the library's own `SearchableVec` and no custom one is needed.
@@ -174,6 +174,8 @@ pub struct IssueTracker {
     projection: Entity<Projection>,
     /// What this window is looking at. Free of gpui, and tested there.
     pub(super) working: WorkingState,
+    /// What it was told to look like. Likewise.
+    preferences: Preferences,
 
     pub(super) title_input: Entity<InputState>,
     pub(super) body_input: Entity<TextareaState>,
@@ -181,9 +183,6 @@ pub struct IssueTracker {
     pub(super) new_issue_input: Entity<InputState>,
     /// Whether the inline "new issue" row is showing.
     pub(super) creating: bool,
-    /// Hiding the sidebar also hides the View list and the theme pickers;
-    /// `cmd-b` brings them back.
-    pub(super) sidebar_hidden: bool,
 
     pub(super) list_focus: FocusHandle,
     /// Replaced on every keystroke; dropping the previous task cancels it,
@@ -217,17 +216,12 @@ impl IssueTracker {
     ) -> Self {
         // Settings and Tag vocabulary are read up front, in a single borrow,
         // so it has ended before any entity is constructed below.
-        let stored = {
+        let (preferences, in_use) = {
             let p = projection.read(cx);
-            RestoredState {
-                light: read_setting(p, settings_keys::THEME_LIGHT),
-                dark: read_setting(p, settings_keys::THEME_DARK),
-                // Anything other than "true" — absent or malformed included —
-                // means visible, which is the safer state to land on.
-                sidebar_hidden: read_setting(p, settings_keys::SIDEBAR_HIDDEN)
-                    .is_some_and(|value| value == "true"),
-                in_use: p.tags_in_use(),
-            }
+            (
+                Preferences::restore(|key| read_setting(p, key)),
+                p.tags_in_use(),
+            )
         };
 
         // Working state settles itself: an unparseable value reads as absent,
@@ -248,14 +242,12 @@ impl IssueTracker {
         // Themes: resolve the persisted choices, falling back to the built-in
         // defaults so a first run looks exactly as it did before this feature.
         let catalogue = ThemeCatalogue::load();
-        let light_config = stored
-            .light
-            .as_deref()
+        let light_config = preferences
+            .theme(ThemeMode::Light)
             .and_then(|name| catalogue.find(ThemeMode::Light, name))
             .map(|choice| choice.config.clone());
-        let dark_config = stored
-            .dark
-            .as_deref()
+        let dark_config = preferences
+            .theme(ThemeMode::Dark)
             .and_then(|name| catalogue.find(ThemeMode::Dark, name))
             .map(|choice| choice.config.clone());
 
@@ -265,20 +257,18 @@ impl IssueTracker {
 
         let light_delegate = ThemeListDelegate::new(catalogue.for_mode(ThemeMode::Light).to_vec());
         let dark_delegate = ThemeListDelegate::new(catalogue.for_mode(ThemeMode::Dark).to_vec());
-        let light_index = stored
-            .light
-            .as_deref()
+        let light_index = preferences
+            .theme(ThemeMode::Light)
             .and_then(|name| light_delegate.index_of(name));
-        let dark_index = stored
-            .dark
-            .as_deref()
+        let dark_index = preferences
+            .theme(ThemeMode::Dark)
             .and_then(|name| dark_delegate.index_of(name));
 
         let light_select = cx.new(|cx| SelectState::new(light_delegate, light_index, window, cx));
         let dark_select = cx.new(|cx| SelectState::new(dark_delegate, dark_index, window, cx));
 
         let tag_select = cx.new(|cx| {
-            ComboboxState::new(tag_items(&stored.in_use), Vec::new(), window, cx)
+            ComboboxState::new(tag_items(&in_use), Vec::new(), window, cx)
                 .multiple(true)
                 .searchable(true)
         });
@@ -409,12 +399,12 @@ impl IssueTracker {
         let mut this = Self {
             projection,
             working,
+            preferences,
             title_input,
             body_input,
             filter_input,
             new_issue_input,
             creating: false,
-            sidebar_hidden: stored.sidebar_hidden,
             list_focus: cx.focus_handle(),
             save_task: None,
             ui_state_task: None,
@@ -914,8 +904,16 @@ impl IssueTracker {
     /// losing your place is not worth interrupting anyone over.
     fn write_ui_state(&mut self, cx: &App) {
         self.ui_state_task = None;
+        self.persist(self.working.settings(), cx);
+    }
 
-        for (key, value) in self.working.settings() {
+    /// The only place a preference or a piece of working state is written.
+    ///
+    /// Failures are logged and never fatal: losing your place, or which theme
+    /// you picked, is not worth interrupting anyone over — and a settings
+    /// table you cannot write to should not take a working window with it.
+    fn persist(&self, pairs: Vec<(&'static str, String)>, cx: &App) {
+        for (key, value) in pairs {
             if let Err(err) = self.projection.read(cx).set_setting(key, &value) {
                 eprintln!("failed to save {key}: {err:#}");
             }
@@ -943,21 +941,13 @@ impl IssueTracker {
     /// be held hostage by a settings write. The worst case is that the next
     /// launch disagrees, which is recoverable with another `cmd-b`.
     pub(super) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.sidebar_hidden = !self.sidebar_hidden;
+        self.preferences.toggle_sidebar();
         cx.notify();
-
-        let value = if self.sidebar_hidden { "true" } else { "false" };
-        if let Err(err) = self
-            .projection
-            .read(cx)
-            .set_setting(settings_keys::SIDEBAR_HIDDEN, value)
-        {
-            eprintln!("failed to save sidebar visibility: {err:#}");
-        }
+        self.persist(self.preferences.settings(), cx);
     }
 
     pub(super) fn sidebar_hidden(&self) -> bool {
-        self.sidebar_hidden
+        self.preferences.sidebar_hidden()
     }
 
     fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
@@ -1019,20 +1009,17 @@ impl IssueTracker {
         };
         let config = choice.config.clone();
 
-        let key = match mode {
-            ThemeMode::Light => settings_keys::THEME_LIGHT,
-            ThemeMode::Dark => settings_keys::THEME_DARK,
-        };
-        if let Err(err) = self.projection.read(cx).set_setting(key, name) {
-            eprintln!("failed to save {key}: {err:#}");
-            return;
-        }
-
+        // Applied first, then remembered. A settings table that cannot be
+        // written should cost you the memory of the choice, not the choice —
+        // returning early here made the picker look broken instead.
         match mode {
             ThemeMode::Light => super::theme::apply_themes(Some(config), None, window, cx),
             ThemeMode::Dark => super::theme::apply_themes(None, Some(config), window, cx),
         }
         cx.notify();
+
+        self.preferences.choose_theme(mode, name);
+        self.persist(self.preferences.settings(), cx);
     }
 
     // ---- delete -------------------------------------------------------------
@@ -1127,19 +1114,11 @@ impl IssueTracker {
     }
 }
 
-/// Everything restored from the `setting` table at startup, read in one borrow.
-struct RestoredState {
-    light: Option<String>,
-    dark: Option<String>,
-    sidebar_hidden: bool,
-    in_use: BTreeSet<Tag>,
-}
-
 impl Render for IssueTracker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // `Option` is an iterator of zero or one, so this drops the sidebar
         // out of the tree entirely rather than rendering it at zero width.
-        let sidebar = if self.sidebar_hidden {
+        let sidebar = if self.sidebar_hidden() {
             None
         } else {
             Some(self.render_sidebar(cx))
