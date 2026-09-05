@@ -9,7 +9,6 @@
 //! folded in with genuine failures. See `docs/adr/0008`.
 
 pub mod args;
-mod client;
 mod render;
 
 use std::ffi::OsString;
@@ -21,8 +20,8 @@ use termcolor::{ColorChoice, StandardStream, WriteColor};
 use crate::api::wire::{IssueJson, TagJson};
 use crate::domain::{IssueId, Priority, Status};
 
+use crate::client::{self, Client, ClientError, Reply, encode};
 use args::{Body, Changes, Colour, Command, Filters, NewIssue, ParentFilter};
-use client::{Client, Reply};
 
 /// Built from the domain rather than written out, so the list of statuses can
 /// never drift from the ones `FromStr` accepts.
@@ -123,6 +122,17 @@ impl Failure {
             Failure::Usage(message) | Failure::Failed(message) | Failure::NotRunning(message) => {
                 message
             }
+        }
+    }
+}
+
+/// The client knows whether there was an app to talk to; only the CLI knows
+/// that this is worth a distinct exit code.
+impl From<ClientError> for Failure {
+    fn from(err: ClientError) -> Self {
+        match err {
+            ClientError::NotRunning(message) => Failure::NotRunning(message),
+            ClientError::Failed(message) => Failure::Failed(message),
         }
     }
 }
@@ -492,26 +502,6 @@ fn broken_pipe(err: std::io::Error) -> Failure {
         std::process::exit(0);
     }
     Failure::failed(format!("writing output: {err}"))
-}
-
-/// Percent-encodes a path segment or query value.
-///
-/// Tag names may hold slashes, and the API reads the whole path remainder as
-/// the name — so in a path a slash is passed through, while in a query value
-/// it is not.
-fn encode(raw: &str, path_segment: bool) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for byte in raw.bytes() {
-        let safe = byte.is_ascii_alphanumeric()
-            || matches!(byte, b'-' | b'_' | b'.' | b'~')
-            || (path_segment && byte == b'/');
-        if safe {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
 }
 
 /// termcolor's own `Auto` inspects `TERM` but not whether stdout is a

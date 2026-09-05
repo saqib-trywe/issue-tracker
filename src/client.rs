@@ -7,6 +7,12 @@
 //! to honour and no chunked encoding to reassemble. The server writes
 //! `Connection: close` and serves one request per connection, so end-of-stream
 //! delimits the body and there is no keep-alive bookkeeping either.
+//!
+//! Shared by every client of the API — the `issue` command and the MCP server
+//! both reach the app through here, and neither reaches the database. It knows
+//! only what the transport can tell it apart: whether there was an app to talk
+//! to. What a caller *does* about that — an exit code, a tool error — is the
+//! caller's business, which is why this does not know about either.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -16,9 +22,44 @@ use serde::Deserialize;
 
 use crate::store;
 
-use super::Failure;
-
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a request did not produce a reply.
+///
+/// Only the distinction the transport can actually make. An API that answered
+/// with a refusal is a [`Reply`], not an error — reading a 409 is the caller's
+/// job, and the sentence it carries is usually worth showing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ClientError {
+    /// There is no app to talk to: no address file, or nothing behind it.
+    NotRunning(String),
+    /// The request was attempted and something broke.
+    Failed(String),
+}
+
+impl ClientError {
+    fn not_running(message: impl Into<String>) -> Self {
+        ClientError::NotRunning(message.into())
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        ClientError::Failed(message.into())
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            ClientError::NotRunning(message) | ClientError::Failed(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(self.message())
+    }
+}
+
+impl std::error::Error for ClientError {}
 
 /// What the app publishes beside the database once its listener is bound.
 #[derive(Deserialize)]
@@ -53,18 +94,18 @@ impl Reply {
 
 /// Reads the published address. Its absence *is* the signal that the app is
 /// not running, so that case is reported as such rather than as a failure.
-pub fn connect() -> Result<Client, Failure> {
-    let path = store::api_file_path().map_err(|err| Failure::failed(format!("{err:#}")))?;
+pub fn connect() -> Result<Client, ClientError> {
+    let path = store::api_file_path().map_err(|err| ClientError::failed(format!("{err:#}")))?;
 
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Failure::not_running(
+            return Err(ClientError::not_running(
                 "Issues is not running. Open it and try again.".to_string(),
             ));
         }
         Err(err) => {
-            return Err(Failure::failed(format!(
+            return Err(ClientError::failed(format!(
                 "reading {}: {err}",
                 path.display()
             )));
@@ -72,7 +113,7 @@ pub fn connect() -> Result<Client, Failure> {
     };
 
     let address: Address = serde_json::from_str(&raw)
-        .map_err(|err| Failure::failed(format!("{} is not readable: {err}", path.display())))?;
+        .map_err(|err| ClientError::failed(format!("{} is not readable: {err}", path.display())))?;
 
     Ok(Client {
         address: SocketAddr::from(([127, 0, 0, 1], address.port)),
@@ -81,27 +122,27 @@ pub fn connect() -> Result<Client, Failure> {
 }
 
 impl Client {
-    pub fn get(&self, path: &str) -> Result<Reply, Failure> {
+    pub fn get(&self, path: &str) -> Result<Reply, ClientError> {
         self.send("GET", path, None)
     }
 
-    pub fn post(&self, path: &str, body: &str) -> Result<Reply, Failure> {
+    pub fn post(&self, path: &str, body: &str) -> Result<Reply, ClientError> {
         self.send("POST", path, Some(body))
     }
 
-    pub fn patch(&self, path: &str, body: &str) -> Result<Reply, Failure> {
+    pub fn patch(&self, path: &str, body: &str) -> Result<Reply, ClientError> {
         self.send("PATCH", path, Some(body))
     }
 
-    pub fn put(&self, path: &str) -> Result<Reply, Failure> {
+    pub fn put(&self, path: &str) -> Result<Reply, ClientError> {
         self.send("PUT", path, None)
     }
 
-    pub fn delete(&self, path: &str) -> Result<Reply, Failure> {
+    pub fn delete(&self, path: &str) -> Result<Reply, ClientError> {
         self.send("DELETE", path, None)
     }
 
-    fn send(&self, method: &str, path: &str, body: Option<&str>) -> Result<Reply, Failure> {
+    fn send(&self, method: &str, path: &str, body: Option<&str>) -> Result<Reply, ClientError> {
         let mut stream = TcpStream::connect_timeout(&self.address, TIMEOUT).map_err(|err| {
             // A published address that nothing answers means the app died
             // without cleaning up. Same remedy, so same exit code — but the
@@ -111,13 +152,13 @@ impl Client {
                 err.kind(),
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
             ) {
-                Failure::not_running(
+                ClientError::not_running(
                     "Issues is not running — it left a stale address file behind. \
                      Open it and try again."
                         .to_string(),
                 )
             } else {
-                Failure::failed(format!("connecting to the API: {err}"))
+                ClientError::failed(format!("connecting to the API: {err}"))
             }
         })?;
         stream.set_read_timeout(Some(TIMEOUT)).ok();
@@ -126,14 +167,14 @@ impl Client {
         stream
             .write_all(&self.request_bytes(method, path, body))
             .and_then(|()| stream.flush())
-            .map_err(|err| Failure::failed(format!("sending the request: {err}")))?;
+            .map_err(|err| ClientError::failed(format!("sending the request: {err}")))?;
         // Tells the server the request is complete without waiting on it.
         stream.shutdown(Shutdown::Write).ok();
 
         let mut raw = Vec::new();
         stream
             .read_to_end(&mut raw)
-            .map_err(|err| Failure::failed(format!("reading the response: {err}")))?;
+            .map_err(|err| ClientError::failed(format!("reading the response: {err}")))?;
 
         parse_reply(&raw)
     }
@@ -162,11 +203,33 @@ impl Client {
     }
 }
 
-fn parse_reply(raw: &[u8]) -> Result<Reply, Failure> {
+/// Percent-encodes a path segment or query value.
+///
+/// Tag names may hold slashes, and the API reads the whole path remainder as
+/// the name — so in a path a slash is passed through, while in a query value
+/// it is not. It lives here rather than with either caller because that rule
+/// is a fact about the API, and two clients encoding it differently would
+/// disagree about which Tag they meant.
+pub fn encode(raw: &str, path_segment: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        let safe = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~')
+            || (path_segment && byte == b'/');
+        if safe {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn parse_reply(raw: &[u8]) -> Result<Reply, ClientError> {
     let split = raw
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| Failure::failed("the API sent a truncated response"))?;
+        .ok_or_else(|| ClientError::failed("the API sent a truncated response"))?;
 
     let head = String::from_utf8_lossy(&raw[..split]);
     let status = head
@@ -174,7 +237,7 @@ fn parse_reply(raw: &[u8]) -> Result<Reply, Failure> {
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| Failure::failed("the API sent an unreadable status line"))?;
+        .ok_or_else(|| ClientError::failed("the API sent an unreadable status line"))?;
 
     Ok(Reply {
         status,
