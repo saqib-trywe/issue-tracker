@@ -284,14 +284,24 @@ pub struct Issue {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The title as displayed when the user hasn't typed one yet.
+///
+/// Free-standing because not every surface holds an `Issue`: the CLI and the
+/// MCP server see a title that arrived as JSON. A blank title has to read the
+/// same in a terminal as it does in the window, and it will not if each
+/// surface decides for itself.
+pub fn display_title(title: &str) -> &str {
+    if title.trim().is_empty() {
+        "Untitled"
+    } else {
+        title
+    }
+}
+
 impl Issue {
     /// The title as displayed when the user hasn't typed one yet.
     pub fn display_title(&self) -> &str {
-        if self.title.trim().is_empty() {
-            "Untitled"
-        } else {
-            &self.title
-        }
+        display_title(&self.title)
     }
 }
 

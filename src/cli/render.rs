@@ -11,7 +11,7 @@ use chrono::{DateTime, Local};
 use termcolor::{Color, ColorSpec, WriteColor};
 
 use crate::api::wire::{IssueJson, TagJson};
-use crate::domain::IssueId;
+use crate::domain::{IssueId, Priority, Status, display_title};
 
 /// How much of a title survives. Fixed rather than measured: fitting the
 /// terminal would mean a `TIOCGWINSZ` ioctl, and an `unsafe` block for column
@@ -65,7 +65,7 @@ pub fn show(
     parent: Option<&IssueJson>,
     children: &[IssueJson],
 ) -> std::io::Result<()> {
-    writeln!(out, "#{} {}", issue.id, issue.title)?;
+    writeln!(out, "#{} {}", issue.id, display_title(&issue.title))?;
 
     write!(out, "  Status    ")?;
     coloured(out, status_colour(&issue.status), |out| {
@@ -91,7 +91,12 @@ pub fn show(
     // Titles rather than bare ids: an id you then have to look up is not an
     // answer, and both are one request away.
     if let Some(parent) = parent {
-        writeln!(out, "  Part of   #{} {}", parent.id, parent.title)?;
+        writeln!(
+            out,
+            "  Part of   #{} {}",
+            parent.id,
+            display_title(&parent.title)
+        )?;
     }
     if !children.is_empty() {
         let done = children.len() - outstanding;
@@ -101,7 +106,7 @@ pub fn show(
             coloured(out, status_colour(&child.status), |out| {
                 write!(out, "{:<STATUS_WIDTH$}", child.status)
             })?;
-            writeln!(out, "  {}", child.title)?;
+            writeln!(out, "  {}", display_title(&child.title))?;
         }
     }
 
@@ -188,7 +193,10 @@ fn title_cell(issue: &IssueJson, settled: &Settled) -> String {
         .unwrap_or_default();
 
     let budget = TITLE_WIDTH.saturating_sub(width(&prefix) + width(&suffix));
-    format!("{prefix}{}{suffix}", truncate(&issue.title, budget))
+    format!(
+        "{prefix}{}{suffix}",
+        truncate(display_title(&issue.title), budget)
+    )
 }
 
 fn truncate(text: &str, budget: usize) -> String {
@@ -210,7 +218,7 @@ fn is_settled(issue: &IssueJson) -> bool {
     // Parsed rather than string-matched, so this cannot drift from the domain.
     issue
         .status
-        .parse::<crate::domain::Status>()
+        .parse::<Status>()
         .map(|status| status.is_settled())
         .unwrap_or(false)
 }
@@ -228,22 +236,24 @@ fn timestamp(raw: &str) -> String {
 
 // ---- colour -----------------------------------------------------------------
 
+/// Parsed rather than string-matched, for the same reason [`is_settled`] is:
+/// a sixth Status is then a non-exhaustive match here — a compile error —
+/// rather than a column that silently loses its colour.
 fn status_colour(status: &str) -> Option<Color> {
-    match status {
-        "Todo" => None,
-        "Doing" => Some(Color::Blue),
-        "Blocked" => Some(Color::Red),
-        "Done" => Some(Color::Green),
-        "Cancelled" => Some(Color::Magenta),
-        _ => None,
+    match status.parse::<Status>().ok()? {
+        Status::Todo => None,
+        Status::Doing => Some(Color::Blue),
+        Status::Blocked => Some(Color::Red),
+        Status::Done => Some(Color::Green),
+        Status::Cancelled => Some(Color::Magenta),
     }
 }
 
 fn priority_colour(priority: &str) -> Option<Color> {
-    match priority {
-        "Urgent" => Some(Color::Red),
-        "High" => Some(Color::Yellow),
-        _ => None,
+    match priority.parse::<Priority>().ok()? {
+        Priority::Urgent => Some(Color::Red),
+        Priority::High => Some(Color::Yellow),
+        Priority::None | Priority::Low | Priority::Medium => None,
     }
 }
 
@@ -297,6 +307,48 @@ mod tests {
         let mut buffer = Buffer::no_color();
         render(&mut buffer).unwrap();
         String::from_utf8(buffer.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn a_blank_title_reads_the_same_here_as_it_does_in_the_window() {
+        // The window shows "Untitled" for a title the user has not typed yet.
+        // Printing the raw title instead gave one Issue two names depending
+        // on where you looked at it.
+        let listed = text(|buffer| list(buffer, &[issue(1, "   ", "Todo")], &Settled::default()));
+        assert!(listed.contains("Untitled"), "{listed}");
+
+        let mut blank = issue(1, "   ", "Todo");
+        blank.parent_id = Some(2);
+        let parent = issue(2, "", "Doing");
+
+        let shown = text(|buffer| show(buffer, &blank, Some(&parent), &[]));
+        assert!(shown.contains("#1 Untitled"), "{shown}");
+        assert!(shown.contains("Part of   #2 Untitled"), "{shown}");
+    }
+
+    #[test]
+    fn every_status_and_priority_label_is_understood_by_the_colours() {
+        // Todo and the low priorities are deliberately uncoloured; everything
+        // else must be recognised. A label the colour function did not know
+        // used to fall through to "no colour", which looks like a style
+        // choice rather than the bug it is.
+        for status in Status::ALL {
+            assert_eq!(
+                status_colour(status.label()).is_some(),
+                status != Status::Todo,
+                "{}",
+                status.label()
+            );
+        }
+        for priority in Priority::ALL {
+            let loud = matches!(priority, Priority::Urgent | Priority::High);
+            assert_eq!(
+                priority_colour(priority.label()).is_some(),
+                loud,
+                "{}",
+                priority.label()
+            );
+        }
     }
 
     #[test]
