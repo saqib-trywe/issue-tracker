@@ -19,7 +19,7 @@ impl IssueTracker {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected = self.selected_id();
+        let selected = self.working.selected();
         // Collected into owned rows first: the Issues are borrowed from the
         // shared Projection through `cx`, and building elements needs `cx`
         // mutably. Only what a row displays is cloned — never the body.
@@ -99,7 +99,7 @@ impl IssueTracker {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(self.active_view().label()),
+                    .child(self.working.view().label()),
             )
             .child(div().flex_1().child(Input::new(&self.filter_input).small()))
             .child(

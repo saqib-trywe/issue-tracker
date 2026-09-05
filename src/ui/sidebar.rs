@@ -13,13 +13,18 @@ use super::theme_catalogue::ThemeListDelegate;
 use super::tracker::IssueTracker;
 use issue_tracker::domain::{Tag, View};
 
+use super::working_state::WorkingState;
+
 impl IssueTracker {
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let active = self.active_view();
-        let counts: Vec<(View, usize)> = View::ALL
-            .into_iter()
-            .map(|view| (view, self.count_for(view, cx)))
-            .collect();
+        let active = self.working.view();
+        let counts: Vec<(View, usize)> = {
+            let issues = self.projection_issues(cx);
+            View::ALL
+                .into_iter()
+                .map(|view| (view, WorkingState::count_for(view, &issues)))
+                .collect()
+        };
 
         div()
             .w(px(232.0))
@@ -65,7 +70,7 @@ impl IssueTracker {
             return None;
         }
 
-        let active = self.active_tag().cloned();
+        let active = self.working.tag().cloned();
         let mut rows = Vec::with_capacity(tags.len());
         for tag in &tags {
             let count = self.count_for_tag(tag, cx);

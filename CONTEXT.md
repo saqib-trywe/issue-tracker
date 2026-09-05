@@ -62,6 +62,15 @@ Narrowing the list to a single Tag. Distinct from a View: a View is predefined
 and a Tag filter is whatever the user invented, and the two compose — a Tag
 filter narrows *within* whichever View is active.
 
+**Working state**:
+What a window is currently looking at: the active View, the Tag filter and
+title filter narrowing it, and which Issue is selected. It belongs to the
+window rather than to the Issues — nothing about an Issue changes because you
+looked at it — and it outlives the window, so reopening the app puts you back
+where you were. A selection that no longer resolves, or a Tag filter whose Tag
+no longer exists, is dropped rather than restored.
+_Avoid_: Session, Context, Mode
+
 ## Cancelling vs deleting
 
 These are different acts and both exist:
