@@ -6,6 +6,12 @@ license = "GPL-3.0-only"
 # Two binaries, so `cargo run` needs telling which one it means.
 default-run = "Issues"
 
+# `issue-mcp` is a workspace member rather than a third `[[bin]]` here, so that
+# its async runtime and MCP SDK are never compiled into this package — see
+# docs/adr/0009.
+[workspace]
+members = ["crates/issue-mcp"]
+
 # The shared core: domain rules, storage, the projection and the HTTP API.
 # It deliberately does not contain `ui` or `app_state`, so nothing in here can
 # reach back into the view — see docs/adr/0008.

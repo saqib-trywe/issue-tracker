@@ -5,9 +5,9 @@ and no second user — several conventions common to issue trackers carry no
 information here and are deliberately absent.
 
 The tracker can be driven from outside the window as well as through it, by
-scripts acting on your behalf. That is still one user: the two are alternative
-ways into the same person's issues, not two participants, and nothing in the
-language below exists to tell them apart.
+scripts and agents acting on your behalf. That is still one user: they are
+alternative ways into the same person's issues, not two participants, and
+nothing in the language below exists to tell them apart.
 
 ## Language
 

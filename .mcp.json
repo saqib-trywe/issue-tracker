@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "issues": {
+      "command": "issue-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
