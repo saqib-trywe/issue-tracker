@@ -62,9 +62,18 @@ Narrowing the list to a single Tag. Distinct from a View: a View is predefined
 and a Tag filter is whatever the user invented, and the two compose — a Tag
 filter narrows *within* whichever View is active.
 
+**Narrowing**:
+A View, optionally within a Tag, optionally matching a title, optionally under
+a Parent — what turns all the Issues into the ones you asked for. Composing is
+all it does: a Narrowing that names nothing admits everything, and there is no
+query language and no saved searches. Every way into the tracker narrows the
+same way, so the window and a script asked the same question get the same
+answer, in the same order.
+_Avoid_: Query, Filter, Search
+
 **Working state**:
-What a window is currently looking at: the active View, the Tag filter and
-title filter narrowing it, and which Issue is selected. It belongs to the
+What a window is currently looking at: a Narrowing, and which Issue within it
+is selected. It belongs to the
 window rather than to the Issues — nothing about an Issue changes because you
 looked at it — and it outlives the window, so reopening the app puts you back
 where you were. A selection that no longer resolves, or a Tag filter whose Tag

@@ -18,10 +18,10 @@ use serde_json::json;
 use termcolor::{ColorChoice, StandardStream, WriteColor};
 
 use crate::api::wire::{IssueJson, TagJson};
-use crate::domain::{IssueId, Priority, Status};
+use crate::domain::{IssueId, ParentFilter, Priority, Status};
 
 use crate::client::{self, Client, ClientError, Reply, encode};
-use args::{Body, Changes, Colour, Command, Filters, NewIssue, ParentFilter};
+use args::{Body, Changes, Colour, Command, Filters, NewIssue};
 
 /// Built from the domain rather than written out, so the list of statuses can
 /// never drift from the ones `FromStr` accepts.

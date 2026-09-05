@@ -11,9 +11,7 @@ use gpui_component::{ActiveTheme, Sizable};
 use super::tag_colour::colour_for;
 use super::theme_catalogue::ThemeListDelegate;
 use super::tracker::IssueTracker;
-use issue_tracker::domain::{Tag, View};
-
-use super::working_state::WorkingState;
+use issue_tracker::domain::{Narrowing, Tag, View};
 
 impl IssueTracker {
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -22,7 +20,7 @@ impl IssueTracker {
             let issues = self.projection_issues(cx);
             View::ALL
                 .into_iter()
-                .map(|view| (view, WorkingState::count_for(view, &issues)))
+                .map(|view| (view, Narrowing::for_view(view).count(&issues)))
                 .collect()
         };
 

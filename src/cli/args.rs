@@ -8,7 +8,7 @@
 
 use std::ffi::OsString;
 
-use crate::domain::{IssueId, Priority, Status, Tag};
+use crate::domain::{IssueId, ParentFilter, Priority, Status, Tag};
 
 use super::Failure;
 
@@ -26,13 +26,6 @@ pub enum Body {
     Text(String),
     /// `--body -`, the form that lets the CLI compose with other commands.
     Stdin,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParentFilter {
-    /// `--parent none`: only Issues that are not part of anything.
-    Unparented,
-    Under(IssueId),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -218,11 +211,9 @@ fn list(mut args: pico_args::Arguments) -> Result<Command, Failure> {
         .map(|raw| parse_as::<Tag>(&raw))
         .transpose()?;
     let search = value(&mut args, "--search")?;
-    let parent = match value(&mut args, "--parent")? {
-        None => None,
-        Some(raw) if raw == "none" => Some(ParentFilter::Unparented),
-        Some(raw) => Some(ParentFilter::Under(id_from(&raw)?)),
-    };
+    let parent = value(&mut args, "--parent")?
+        .map(|raw| parse_as::<ParentFilter>(&raw))
+        .transpose()?;
     rest(args, 0, "list")?;
 
     Ok(Command::List(Filters {

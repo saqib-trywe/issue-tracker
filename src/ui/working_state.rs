@@ -13,7 +13,7 @@
 //! Working state is per window, as `docs/adr/0005` requires, which is why it
 //! lives here rather than in the shared library.
 
-use issue_tracker::domain::{Issue, IssueId, Tag, View};
+use issue_tracker::domain::{Issue, IssueId, Narrowing, Tag, View};
 use issue_tracker::store::settings_keys;
 
 /// What changed, for the caller to act on.
@@ -36,14 +36,11 @@ impl Settled {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct WorkingState {
-    view: View,
+    /// What the window is showing. The rule for *which* Issues that admits
+    /// lives on [`Narrowing`], in the domain, because the API asks the same
+    /// question. This holds the answer the user has chosen.
+    narrowing: Narrowing,
     selected: Option<IssueId>,
-    /// Substring filter over titles, driven by the list header input.
-    filter: String,
-    /// Narrows the list to one Tag *within* the active View. Deliberately not
-    /// a `View` variant: a View is predefined, a Tag filter is whatever the
-    /// user invented. See docs/adr/0004.
-    tag_filter: Option<Tag>,
 }
 
 impl WorkingState {
@@ -55,11 +52,15 @@ impl WorkingState {
     /// should not cost you the window.
     pub fn restore(issues: &[Issue], read: impl Fn(&str) -> Option<String>) -> Self {
         let mut state = WorkingState {
-            view: read(settings_keys::UI_VIEW)
-                .and_then(|value| value.parse::<View>().ok())
-                .unwrap_or_default(),
-            filter: read(settings_keys::UI_FILTER).unwrap_or_default(),
-            tag_filter: read(settings_keys::UI_TAG).and_then(|value| value.parse::<Tag>().ok()),
+            narrowing: Narrowing {
+                view: read(settings_keys::UI_VIEW)
+                    .and_then(|value| value.parse::<View>().ok())
+                    .unwrap_or_default(),
+                tag: read(settings_keys::UI_TAG).and_then(|value| value.parse::<Tag>().ok()),
+                title: read(settings_keys::UI_FILTER).filter(|text| !text.is_empty()),
+                // The window has no Parent control; the API does.
+                parent: None,
+            },
             selected: read(settings_keys::UI_SELECTED)
                 .and_then(|value| value.parse::<IssueId>().ok()),
         };
@@ -73,15 +74,16 @@ impl WorkingState {
     /// and this owns the list of what there is to write.
     pub fn settings(&self) -> Vec<(&'static str, String)> {
         vec![
-            (settings_keys::UI_VIEW, self.view.to_string()),
+            (settings_keys::UI_VIEW, self.narrowing.view.to_string()),
             (
                 settings_keys::UI_SELECTED,
                 self.selected.map(|id| id.to_string()).unwrap_or_default(),
             ),
-            (settings_keys::UI_FILTER, self.filter.clone()),
+            (settings_keys::UI_FILTER, self.filter().to_string()),
             (
                 settings_keys::UI_TAG,
-                self.tag_filter
+                self.narrowing
+                    .tag
                     .as_ref()
                     .map(|tag| tag.as_str().to_owned())
                     .unwrap_or_default(),
@@ -92,11 +94,11 @@ impl WorkingState {
     // ---- what is being looked at --------------------------------------------
 
     pub fn view(&self) -> View {
-        self.view
+        self.narrowing.view
     }
 
     pub fn tag(&self) -> Option<&Tag> {
-        self.tag_filter.as_ref()
+        self.narrowing.tag.as_ref()
     }
 
     pub fn selected(&self) -> Option<IssueId> {
@@ -104,32 +106,12 @@ impl WorkingState {
     }
 
     pub fn filter(&self) -> &str {
-        &self.filter
+        self.narrowing.title.as_deref().unwrap_or_default()
     }
 
-    /// Issues in the active View matching both filters, in display order.
-    ///
-    /// The three narrowings compose: a Tag filter narrows *within* a View,
-    /// and the title filter narrows within both.
+    /// The Issues this window is showing, in display order.
     pub fn visible<'a>(&self, issues: &'a [Issue]) -> Vec<&'a Issue> {
-        let needle = self.filter.trim().to_lowercase();
-        issues
-            .iter()
-            .filter(|issue| self.view.contains(issue))
-            .filter(|issue| needle.is_empty() || issue.title.to_lowercase().contains(&needle))
-            .filter(|issue| {
-                self.tag_filter
-                    .as_ref()
-                    .is_none_or(|tag| issue.tags.contains(tag))
-            })
-            .collect()
-    }
-
-    /// How many Issues a View would show, ignoring both filters — which is
-    /// why it takes no `self`: a sidebar badge counts the View, not the
-    /// narrowing currently applied to it.
-    pub fn count_for(view: View, issues: &[Issue]) -> usize {
-        issues.iter().filter(|issue| view.contains(issue)).count()
+        self.narrowing.select(issues)
     }
 
     // ---- changing what is being looked at ------------------------------------
@@ -147,7 +129,7 @@ impl WorkingState {
     }
 
     pub fn select_view(&mut self, view: View, issues: &[Issue]) -> Settled {
-        self.view = view;
+        self.narrowing.view = view;
         self.reselect(issues)
     }
 
@@ -161,7 +143,7 @@ impl WorkingState {
 
     /// Applies a Tag filter, or clears it when the active Tag is picked again.
     pub fn toggle_tag(&mut self, tag: Tag, issues: &[Issue]) -> Settled {
-        self.tag_filter = if self.tag_filter.as_ref() == Some(&tag) {
+        self.narrowing.tag = if self.narrowing.tag.as_ref() == Some(&tag) {
             None
         } else {
             Some(tag)
@@ -169,8 +151,10 @@ impl WorkingState {
         self.reselect(issues)
     }
 
+    /// An emptied filter box is stored as no filter at all, so that what is
+    /// written and what comes back agree.
     pub fn set_filter(&mut self, text: String, issues: &[Issue]) -> Settled {
-        self.filter = text;
+        self.narrowing.title = Some(text).filter(|text| !text.is_empty());
         self.reselect(issues)
     }
 
@@ -199,10 +183,10 @@ impl WorkingState {
 
     /// Drops a Tag filter whose Tag no longer exists.
     fn prune_tag(&mut self, issues: &[Issue]) {
-        if let Some(tag) = &self.tag_filter
+        if let Some(tag) = &self.narrowing.tag
             && !issues.iter().any(|issue| issue.tags.contains(tag))
         {
-            self.tag_filter = None;
+            self.narrowing.tag = None;
         }
     }
 
@@ -255,40 +239,33 @@ mod tests {
     }
 
     #[test]
-    fn the_three_narrowings_compose() {
+    fn the_mutators_reach_the_narrowing() {
+        // The rule itself is `Narrowing`'s and is tested there; this is the
+        // wiring — that changing what you are looking at changes what you see.
         let issues = corpus();
         let mut state = WorkingState::default();
-        assert_eq!(state.visible(&issues).len(), 3, "All Issues by default");
+        assert_eq!(state.visible(&issues).len(), 3);
 
-        // A Tag filter narrows within the View...
         state.toggle_tag("ui".parse().unwrap(), &issues);
         assert_eq!(state.visible(&issues).len(), 2);
 
-        // ...the title filter narrows within both...
         state.set_filter("ship".into(), &issues);
         assert_eq!(state.visible(&issues).len(), 1);
-        assert_eq!(state.visible(&issues)[0].id, 3);
 
-        // ...and the View narrows all of it.
         state.select_view(View::WithStatus(Status::Todo), &issues);
         assert!(state.visible(&issues).is_empty());
     }
 
     #[test]
-    fn the_title_filter_ignores_case_and_surrounding_space() {
+    fn an_emptied_filter_box_is_no_filter_at_all() {
         let issues = corpus();
         let mut state = WorkingState::default();
-        state.set_filter("  FLASH  ".into(), &issues);
+        state.set_filter("flash".into(), &issues);
         assert_eq!(state.visible(&issues).len(), 1);
-        assert_eq!(state.visible(&issues)[0].id, 1);
-    }
 
-    #[test]
-    fn a_tag_filter_ignores_case_because_tag_identity_does() {
-        let issues = corpus();
-        let mut state = WorkingState::default();
-        state.toggle_tag("UI".parse().unwrap(), &issues);
-        assert_eq!(state.visible(&issues).len(), 2);
+        state.set_filter(String::new(), &issues);
+        assert_eq!(state.visible(&issues).len(), 3);
+        assert_eq!(state.filter(), "");
     }
 
     #[test]
@@ -466,19 +443,5 @@ mod tests {
                 .map(|(_, value)| value.clone())
         });
         assert_eq!(restored, state);
-    }
-
-    #[test]
-    fn a_view_count_ignores_the_filters_narrowing_it() {
-        let issues = corpus();
-        let mut state = WorkingState::default();
-        state.set_filter("nothing matches".into(), &issues);
-
-        assert!(state.visible(&issues).is_empty());
-        assert_eq!(WorkingState::count_for(View::All, &issues), 3);
-        assert_eq!(
-            WorkingState::count_for(View::WithStatus(Status::Done), &issues),
-            1
-        );
     }
 }

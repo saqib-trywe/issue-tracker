@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 
 use super::http::{Request, Response};
 use super::wire::{IssueJson, NewIssue, PatchIssue, TagJson};
-use crate::domain::{Issue, IssueId, Status, Tag};
+use crate::domain::{Issue, IssueId, Narrowing, ParentFilter, Status, Tag, View};
 use crate::projection::{Projection, WriteError};
 
 enum Route {
@@ -105,67 +105,48 @@ pub fn dispatch(request: &Request, projection: &mut Projection) -> Response {
 
 // ---- handlers ---------------------------------------------------------------
 
-/// What `?parent=` asked for.
-enum ParentFilter {
-    /// `?parent=none` — only Issues that are not part of anything.
-    Unparented,
-    /// `?parent=7` — the sub-issues of one Issue.
-    Under(IssueId),
-}
-
-impl ParentFilter {
-    fn matches(&self, issue: &Issue) -> bool {
-        match self {
-            ParentFilter::Unparented => issue.parent_id.is_none(),
-            ParentFilter::Under(parent) => issue.parent_id == Some(*parent),
-        }
-    }
-}
-
-/// `GET /issues`, with the narrowings the UI offers — a Status slice, a Tag
-/// filter and a title substring — plus a parent filter the UI expresses
-/// through the shape of its rows rather than as a control.
+/// `GET /issues`, with the narrowings the window offers — a Status slice, a
+/// Tag filter and a title substring — plus a Parent filter the window
+/// expresses through the shape of its rows rather than as a control.
+///
+/// The narrowing itself is `domain::Narrowing`, shared with the window. All
+/// this does is turn a query string into one, so the two surfaces cannot
+/// disagree about what a filter means.
 fn list_issues(request: &Request, projection: &Projection) -> Response {
-    let status = match request.param("status").map(str::parse::<Status>) {
-        Some(Ok(status)) => Some(status),
+    // An absent `?status=` is not a missing filter to remember: it is the
+    // View that admits everything.
+    let view = match request.param("status").map(str::parse::<Status>) {
+        Some(Ok(status)) => View::WithStatus(status),
         Some(Err(err)) => return Response::error(400, err),
-        None => None,
+        None => View::All,
     };
     let tag = match request.param("tag").map(str::parse::<Tag>) {
         Some(Ok(tag)) => Some(tag),
         Some(Err(err)) => return Response::error(400, err),
         None => None,
     };
-    // `none` is a literal rather than an empty value, because an empty one is
-    // what a client sends by accident when a variable was never set.
-    let parent = match request.param("parent") {
-        Some("none") => Some(ParentFilter::Unparented),
-        Some(raw) => match raw.parse::<IssueId>() {
-            Ok(id) => Some(ParentFilter::Under(id)),
-            Err(_) => {
-                return Response::error(400, format!("parent must be an id or \"none\": {raw}"));
-            }
-        },
+    let parent = match request.param("parent").map(str::parse::<ParentFilter>) {
+        Some(Ok(parent)) => Some(parent),
+        // The hint matters: `none` being a literal rather than an empty value
+        // is not guessable, and this is where a caller finds out.
+        Some(Err(err)) => {
+            return Response::error(400, format!("{err} — use an issue id or \"none\""));
+        }
         None => None,
     };
-    let needle = request
-        .param("q")
-        .map(|query| query.trim().to_lowercase())
-        .filter(|query| !query.is_empty());
 
-    // `issues()` is already in display order, so the API and the UI agree on
-    // what "first" means.
-    let issues: Vec<IssueJson> = projection
-        .issues()
-        .iter()
-        .filter(|issue| status.is_none_or(|status| issue.status == status))
-        .filter(|issue| tag.as_ref().is_none_or(|tag| issue.tags.contains(tag)))
-        .filter(|issue| parent.as_ref().is_none_or(|parent| parent.matches(issue)))
-        .filter(|issue| {
-            needle
-                .as_ref()
-                .is_none_or(|needle| issue.title.to_lowercase().contains(needle))
-        })
+    let narrowing = Narrowing {
+        view,
+        tag,
+        title: request.param("q").map(str::to_owned),
+        parent,
+    };
+
+    // `issues()` is already in display order, and narrowing preserves it, so
+    // the API and the window agree on what "first" means.
+    let issues: Vec<IssueJson> = narrowing
+        .select(projection.issues())
+        .into_iter()
         .map(|issue| issue_json(projection, issue))
         .collect();
 

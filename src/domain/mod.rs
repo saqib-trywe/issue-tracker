@@ -369,6 +369,109 @@ impl FromStr for View {
     }
 }
 
+/// Which Issues a Parent narrowing admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentFilter {
+    /// Only Issues that are not part of anything.
+    Unparented,
+    /// The Sub-issues of one Issue.
+    Under(IssueId),
+}
+
+impl ParentFilter {
+    pub fn matches(self, issue: &Issue) -> bool {
+        match self {
+            ParentFilter::Unparented => issue.parent_id.is_none(),
+            ParentFilter::Under(parent) => issue.parent_id == Some(parent),
+        }
+    }
+}
+
+/// `none` is a literal rather than an empty value, because an empty one is
+/// what a caller sends by accident when a variable was never set.
+impl FromStr for ParentFilter {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "none" {
+            return Ok(ParentFilter::Unparented);
+        }
+        s.parse::<IssueId>()
+            .map(ParentFilter::Under)
+            .map_err(|_| ParseError {
+                kind: "parent",
+                value: s.to_owned(),
+            })
+    }
+}
+
+/// One narrowing of the Issues.
+///
+/// Composition is all it does: a View, optionally within a Tag, optionally
+/// matching a title, optionally under a Parent. There is deliberately no query
+/// language — no `status:done tag:ui`, no saved searches — because a View is
+/// predefined and everything else here narrows within one.
+///
+/// It lives in `domain` because every surface asks the same question: the
+/// window narrows by what you clicked, the API by its query string. Written
+/// twice, the two drift, and they had already started to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Narrowing {
+    pub view: View,
+    pub tag: Option<Tag>,
+    /// Matched against the title, ignoring case and surrounding space.
+    /// Titles only — never bodies, never Tag names.
+    pub title: Option<String>,
+    pub parent: Option<ParentFilter>,
+}
+
+impl Narrowing {
+    /// A whole View, unnarrowed.
+    pub fn for_view(view: View) -> Self {
+        Narrowing {
+            view,
+            ..Default::default()
+        }
+    }
+
+    /// The matching Issues, in the order they were given — which is display
+    /// order, so every surface agrees on what "first" means.
+    pub fn select<'a>(&self, issues: &'a [Issue]) -> Vec<&'a Issue> {
+        let needle = self.needle();
+        issues
+            .iter()
+            .filter(|issue| self.admits(issue, needle.as_deref()))
+            .collect()
+    }
+
+    /// How many match, without materialising them — a sidebar badge wants the
+    /// number and nothing else, once per View per render.
+    pub fn count(&self, issues: &[Issue]) -> usize {
+        let needle = self.needle();
+        issues
+            .iter()
+            .filter(|issue| self.admits(issue, needle.as_deref()))
+            .count()
+    }
+
+    /// Folded once per call rather than once per Issue. A blank title match
+    /// is no match at all, so a filter box the user has emptied narrows
+    /// nothing.
+    fn needle(&self) -> Option<String> {
+        self.title
+            .as_ref()
+            .map(|title| title.trim().to_lowercase())
+            .filter(|title| !title.is_empty())
+    }
+
+    fn admits(&self, issue: &Issue, needle: Option<&str>) -> bool {
+        self.view.contains(issue)
+            && self.tag.as_ref().is_none_or(|tag| issue.tags.contains(tag))
+            && self.parent.is_none_or(|parent| parent.matches(issue))
+            && needle.is_none_or(|needle| issue.title.to_lowercase().contains(needle))
+    }
+}
+
 /// Orders Issues for display: highest priority first, then most recently
 /// updated. Ties break on `id` so the order is never ambiguous.
 pub fn sort_for_display(issues: &mut [Issue]) {
@@ -383,6 +486,168 @@ pub fn sort_for_display(issues: &mut [Issue]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A corpus for narrowing: distinct Statuses, Tags and parentage.
+    fn corpus() -> Vec<Issue> {
+        let mut issues = vec![
+            narrowable(1, "Fix the flash", Status::Doing, &["ui"]),
+            narrowable(2, "Write the ADR", Status::Todo, &["docs"]),
+            narrowable(3, "Ship the CLI", Status::Done, &["ui", "cli"]),
+            narrowable(4, "Chase the bug", Status::Todo, &[]),
+        ];
+        issues[3].parent_id = Some(1);
+        issues
+    }
+
+    fn narrowable(id: IssueId, title: &str, status: Status, tags: &[&str]) -> Issue {
+        Issue {
+            id,
+            title: title.to_string(),
+            body: String::new(),
+            status,
+            priority: Priority::None,
+            tags: tags.iter().map(|tag| tag.parse().unwrap()).collect(),
+            parent_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn ids(issues: Vec<&Issue>) -> Vec<IssueId> {
+        issues.into_iter().map(|issue| issue.id).collect()
+    }
+
+    #[test]
+    fn an_empty_narrowing_admits_everything() {
+        let issues = corpus();
+        assert_eq!(Narrowing::default().select(&issues).len(), 4);
+        assert_eq!(Narrowing::default().count(&issues), 4);
+    }
+
+    #[test]
+    fn a_narrowing_keeps_the_order_it_was_given() {
+        // Display order is decided once, by `sort_for_display`; narrowing
+        // must not quietly reorder, or "the first one" would mean different
+        // things in the window and over HTTP.
+        let issues = corpus();
+        assert_eq!(ids(Narrowing::default().select(&issues)), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn the_narrowings_compose() {
+        let issues = corpus();
+        let ui = Narrowing {
+            tag: Some("ui".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(ids(ui.select(&issues)), vec![1, 3]);
+
+        // A Tag narrows within a View, and a title within both.
+        let within = Narrowing {
+            view: View::WithStatus(Status::Done),
+            title: Some("ship".into()),
+            ..ui.clone()
+        };
+        assert_eq!(ids(within.select(&issues)), vec![3]);
+
+        let contradictory = Narrowing {
+            view: View::WithStatus(Status::Todo),
+            ..within
+        };
+        assert!(contradictory.select(&issues).is_empty());
+    }
+
+    #[test]
+    fn a_title_match_ignores_case_and_surrounding_space() {
+        let issues = corpus();
+        let narrowing = Narrowing {
+            title: Some("  FLASH  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(ids(narrowing.select(&issues)), vec![1]);
+    }
+
+    #[test]
+    fn a_blank_title_match_narrows_nothing() {
+        // An emptied filter box must show everything, not nothing.
+        let issues = corpus();
+        for blank in ["", "   "] {
+            let narrowing = Narrowing {
+                title: Some(blank.into()),
+                ..Default::default()
+            };
+            assert_eq!(narrowing.count(&issues), 4, "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn a_title_match_reads_titles_only() {
+        let mut issues = corpus();
+        issues[0].body = "mentions the ADR".to_string();
+        let narrowing = Narrowing {
+            title: Some("ADR".into()),
+            ..Default::default()
+        };
+        assert_eq!(ids(narrowing.select(&issues)), vec![2], "not the body");
+    }
+
+    #[test]
+    fn a_tag_match_folds_case_because_tag_identity_does() {
+        let issues = corpus();
+        let narrowing = Narrowing {
+            tag: Some("UI".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(ids(narrowing.select(&issues)), vec![1, 3]);
+    }
+
+    #[test]
+    fn a_parent_narrowing_asks_both_halves_of_the_question() {
+        let issues = corpus();
+
+        let under = Narrowing {
+            parent: Some(ParentFilter::Under(1)),
+            ..Default::default()
+        };
+        assert_eq!(ids(under.select(&issues)), vec![4]);
+
+        let top = Narrowing {
+            parent: Some(ParentFilter::Unparented),
+            ..Default::default()
+        };
+        assert_eq!(ids(top.select(&issues)), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_parent_filter_reads_an_id_or_the_literal_none() {
+        assert_eq!(
+            "none".parse::<ParentFilter>().unwrap(),
+            ParentFilter::Unparented
+        );
+        assert_eq!("7".parse::<ParentFilter>().unwrap(), ParentFilter::Under(7));
+
+        // An empty value is what a caller sends when a variable was never
+        // set, so it must not quietly mean "none".
+        for bad in ["", "all", "none ", "None", "seven"] {
+            let err = bad.parse::<ParentFilter>().unwrap_err();
+            assert_eq!(err.kind, "parent", "{bad:?}");
+            assert!(err.to_string().contains(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn counting_a_view_ignores_everything_narrowing_it() {
+        let issues = corpus();
+        assert_eq!(Narrowing::for_view(View::All).count(&issues), 4);
+        assert_eq!(
+            Narrowing::for_view(View::WithStatus(Status::Todo)).count(&issues),
+            2
+        );
+        assert_eq!(
+            Narrowing::for_view(View::WithStatus(Status::Cancelled)).count(&issues),
+            0
+        );
+    }
 
     fn issue(id: IssueId, priority: Priority, updated_at: &str) -> Issue {
         let at = DateTime::parse_from_rfc3339(updated_at)
