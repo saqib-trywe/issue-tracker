@@ -49,6 +49,11 @@ pub fn migrations() -> Migrations<'static> {
             "ALTER TABLE issue
              ADD COLUMN parent_id INTEGER REFERENCES issue(id) ON DELETE SET NULL;",
         ),
+        // Size. Nullable with no default, because an absent Size means "not
+        // decided yet" and `0` means "no work" — so every Issue that existed
+        // before this migration is unsized rather than sized zero. See
+        // docs/adr/0011.
+        M::up("ALTER TABLE issue ADD COLUMN size INTEGER;"),
     ])
 }
 

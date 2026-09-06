@@ -19,6 +19,10 @@ const TITLE_WIDTH: usize = 52;
 const STATUS_WIDTH: usize = 9;
 const PRIORITY_WIDTH: usize = 8;
 
+/// Wide enough for a four-digit total, which is more than a one-level tree of
+/// `u8` Sizes reaches in practice.
+const SIZE_WIDTH: usize = 5;
+
 pub fn list(out: &mut dyn WriteColor, issues: &[IssueJson]) -> std::io::Result<()> {
     if issues.is_empty() {
         return writeln!(out, "No issues.");
@@ -34,8 +38,9 @@ pub fn list(out: &mut dyn WriteColor, issues: &[IssueJson]) -> std::io::Result<(
     dim(out, |out| {
         writeln!(
             out,
-            "{:>id_width$}  {:<STATUS_WIDTH$}  {:<PRIORITY_WIDTH$}  {:<TITLE_WIDTH$}  TAGS",
-            "ID", "STATUS", "PRIORITY", "TITLE"
+            "{:>id_width$}  {:<STATUS_WIDTH$}  {:<PRIORITY_WIDTH$}  {:>SIZE_WIDTH$}  \
+             {:<TITLE_WIDTH$}  TAGS",
+            "ID", "STATUS", "PRIORITY", "SIZE", "TITLE"
         )
     })?;
 
@@ -47,6 +52,13 @@ pub fn list(out: &mut dyn WriteColor, issues: &[IssueJson]) -> std::io::Result<(
         coloured(out, priority_colour(&issue.priority), |out| {
             write!(out, "{:<PRIORITY_WIDTH$}  ", issue.priority)
         })?;
+        // The total, not the Issue's own Size: a Parent's row should say what
+        // the whole family comes to.
+        let size = issue
+            .total_size
+            .map(|total| total.to_string())
+            .unwrap_or_default();
+        write!(out, "{size:>SIZE_WIDTH$}  ")?;
         write!(out, "{:<TITLE_WIDTH$}  ", title_cell(issue))?;
         dim(out, |out| writeln!(out, "{}", issue.tags.join(", ")))?;
     }
@@ -77,6 +89,30 @@ pub fn show(
     coloured(out, priority_colour(&issue.priority), |out| {
         writeln!(out, "{}", issue.priority)
     })?;
+
+    // Absent when nothing in the family carries a Size: a tracker that never
+    // sizes anything should not grow a row saying so.
+    if let Some(total) = issue.total_size {
+        write!(out, "  Size      ")?;
+        // An en dash for a Parent that carries no Size of its own: its parts
+        // account for all of it.
+        match issue.size {
+            Some(own) => write!(out, "{own}")?,
+            None => write!(out, "\u{2013}")?,
+        }
+        if !issue.sub_issue_ids.is_empty() {
+            let sized = issue.sub_issue_ids.len() - issue.unsized_sub_issues;
+            write!(out, "  ")?;
+            dim(out, |out| {
+                write!(
+                    out,
+                    "(total {total}, {sized} of {} part(s) sized)",
+                    issue.sub_issue_ids.len()
+                )
+            })?;
+        }
+        writeln!(out)?;
+    }
 
     if !issue.tags.is_empty() {
         writeln!(out, "  Tags      {}", issue.tags.join(", "))?;
@@ -248,6 +284,9 @@ mod tests {
             parent_id: None,
             sub_issue_ids: Vec::new(),
             settled_sub_issues: 0,
+            size: None,
+            total_size: None,
+            unsized_sub_issues: 0,
             created_at: "2026-09-05T14:23:11.482913Z".to_string(),
             updated_at: "2026-09-05T14:23:11.482913Z".to_string(),
         }
@@ -333,6 +372,70 @@ mod tests {
 
         let out = text(|buffer| list(buffer, &[parent]));
         assert!(out.contains("[1/2]"), "{out}");
+    }
+
+    #[test]
+    fn an_unsized_tracker_grows_no_size_row() {
+        let out = text(|buffer| show(buffer, &issue(1, "unsized", "Todo"), None, &[]));
+        assert!(!out.contains("Size"), "{out}");
+
+        let listed = text(|buffer| list(buffer, &[issue(1, "unsized", "Todo")]));
+        // The column is always in the header; the cell is blank.
+        assert!(listed.contains("SIZE"), "{listed}");
+        assert!(listed.contains("unsized"), "{listed}");
+    }
+
+    #[test]
+    fn a_leaf_shows_its_own_size_and_nothing_about_parts() {
+        let mut leaf = issue(1, "leaf", "Todo");
+        leaf.size = Some(5);
+        leaf.total_size = Some(5);
+
+        let out = text(|buffer| show(buffer, &leaf, None, &[]));
+        assert!(out.contains("Size      5"), "{out}");
+        assert!(!out.contains("part(s) sized"), "{out}");
+    }
+
+    #[test]
+    fn a_parent_shows_its_own_size_beside_the_total() {
+        // The Parent's own 3 is the work its parts do not cover, so the total
+        // is 3 + 5 + 8 rather than 5 + 8.
+        let mut parent = issue(1, "parent", "Todo");
+        parent.size = Some(3);
+        parent.sub_issue_ids = vec![2, 3, 4];
+        parent.unsized_sub_issues = 1;
+        parent.total_size = Some(16);
+
+        let out = text(|buffer| show(buffer, &parent, None, &[]));
+        assert!(out.contains("Size      3"), "its own: {out}");
+        assert!(
+            out.contains("(total 16, 2 of 3 part(s) sized)"),
+            "and the whole: {out}"
+        );
+    }
+
+    #[test]
+    fn a_parent_carrying_no_size_of_its_own_still_totals_its_parts() {
+        let mut parent = issue(1, "parent", "Todo");
+        parent.sub_issue_ids = vec![2];
+        parent.total_size = Some(5);
+
+        let out = text(|buffer| show(buffer, &parent, None, &[]));
+        assert!(out.contains("Size      \u{2013}"), "an en dash: {out}");
+        assert!(out.contains("total 5"), "{out}");
+    }
+
+    #[test]
+    fn the_list_column_carries_the_total_not_the_own_size() {
+        // A Parent's row should say what the whole family comes to.
+        let mut parent = issue(1, "parent", "Todo");
+        parent.size = Some(3);
+        parent.sub_issue_ids = vec![2];
+        parent.total_size = Some(11);
+
+        let listed = text(|buffer| list(buffer, &[parent]));
+        assert!(listed.contains("11"), "{listed}");
+        assert!(!listed.contains(" 3  "), "not the own size: {listed}");
     }
 
     #[test]

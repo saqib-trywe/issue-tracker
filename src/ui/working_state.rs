@@ -217,6 +217,7 @@ mod tests {
             priority: Priority::None,
             tags: tags.iter().map(|tag| tag.parse().unwrap()).collect(),
             parent_id: None,
+            size: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

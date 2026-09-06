@@ -85,6 +85,7 @@ actions!(
         DeleteIssue,
         FocusFilter,
         FocusTags,
+        FocusSize,
         FocusSubIssues,
         CancelEditing,
         ToggleSidebar,
@@ -157,6 +158,10 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("/", FocusFilter, Some(LIST_CONTEXT)),
         KeyBinding::new("t", FocusTags, Some(LIST_CONTEXT)),
         KeyBinding::new("s", FocusSubIssues, Some(LIST_CONTEXT)),
+        // `s` is taken by sub-issues and `e` by the title, so Size gets `z`.
+        // A duplicate binding is resolved silently in favour of one of them,
+        // so a clash here is invisible rather than an error.
+        KeyBinding::new("z", FocusSize, Some(LIST_CONTEXT)),
         KeyBinding::new("escape", CancelEditing, None),
         // Deliberately unscoped: unlike j/k/c these have to work while a text
         // input has focus, and cmd chords cannot collide with typing.
@@ -179,6 +184,9 @@ pub struct IssueTracker {
 
     pub(super) title_input: Entity<InputState>,
     pub(super) body_input: Entity<TextareaState>,
+    /// A number, or empty for unsized. Saved on the same debounce as the
+    /// title and body, because it is edited the same way.
+    pub(super) size_input: Entity<InputState>,
     pub(super) filter_input: Entity<InputState>,
     pub(super) new_issue_input: Entity<InputState>,
     /// Whether the inline "new issue" row is showing.
@@ -233,6 +241,7 @@ impl IssueTracker {
         };
 
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue title"));
+        let size_input = cx.new(|cx| InputState::new(window, cx).placeholder("—"));
         let body_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(8, 40)
@@ -300,6 +309,11 @@ impl IssueTracker {
                 },
             ),
             cx.subscribe_in(&body_input, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.schedule_save(cx);
+                }
+            }),
+            cx.subscribe_in(&size_input, window, |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.schedule_save(cx);
                 }
@@ -402,6 +416,7 @@ impl IssueTracker {
             preferences,
             title_input,
             body_input,
+            size_input,
             filter_input,
             new_issue_input,
             creating: false,
@@ -484,6 +499,11 @@ impl IssueTracker {
         self.projection.read(cx).get(parent).cloned()
     }
 
+    /// One Issue's parts, borrowed. Used to roll up a Size per row.
+    pub(super) fn projection_sub_issues<'a>(&self, id: IssueId, cx: &'a App) -> Vec<&'a Issue> {
+        self.projection.read(cx).sub_issues(id)
+    }
+
     /// Settled-over-total for an Issue's parts, or `None` when it has none.
     pub(super) fn settled_progress(&self, id: IssueId, cx: &App) -> Option<(usize, usize)> {
         self.projection.read(cx).settled_progress(id)
@@ -525,9 +545,13 @@ impl IssueTracker {
     /// refreshed, because stale text there would be written straight back over
     /// that same change on the next keystroke.
     fn refresh_inputs(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let (title, body) = match self.selected_issue(cx) {
-            Some(issue) => (issue.title.clone(), issue.body.clone()),
-            None => (String::new(), String::new()),
+        let (title, body, size) = match self.selected_issue(cx) {
+            Some(issue) => (
+                issue.title.clone(),
+                issue.body.clone(),
+                issue.size.map(|size| size.to_string()).unwrap_or_default(),
+            ),
+            None => (String::new(), String::new(), String::new()),
         };
 
         let title_focused = self
@@ -544,6 +568,11 @@ impl IssueTracker {
         if force || !body_focused {
             self.body_input
                 .update(cx, |input, cx| input.set_value(body, window, cx));
+        }
+        let size_focused = self.size_input.read(cx).focus_handle(cx).is_focused(window);
+        if force || !size_focused {
+            self.size_input
+                .update(cx, |input, cx| input.set_value(size, window, cx));
         }
 
         // The pickers are part of "what the selected Issue looks like", so
@@ -666,9 +695,23 @@ impl IssueTracker {
         self.save_task = None;
         let title = self.title_input.read(cx).value().to_string();
         let body = self.body_input.read(cx).value().to_string();
-        self.write(cx, |projection| {
-            projection.patch(id, IssuePatch::default().title(title).body(body))
-        });
+        let typed = self.size_input.read(cx).value().to_string();
+
+        let patch = IssuePatch::default().title(title).body(body);
+        let patch = match typed.trim() {
+            "" => patch.clear_size(),
+            // A half-typed or over-large number leaves the stored Size alone
+            // rather than clobbering a good value; the input is put back the
+            // next time the selection moves.
+            // Qualified: `gpui::Size` is in scope from the glob import, and
+            // is a width-and-height, not this.
+            text => match text.parse::<issue_tracker::domain::Size>() {
+                Ok(size) => patch.size(size),
+                Err(_) => patch,
+            },
+        };
+
+        self.write(cx, |projection| projection.patch(id, patch));
     }
 
     pub(super) fn set_status(
@@ -1085,6 +1128,16 @@ impl IssueTracker {
         }
     }
 
+    /// The size input is not reachable by tabbing — focus goes through the
+    /// Status buttons first — so it gets a binding of its own, as the tag
+    /// editor does.
+    fn on_focus_size(&mut self, _: &FocusSize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.working.selected().is_some() {
+            self.size_input
+                .update(cx, |input, cx| input.focus(window, cx));
+        }
+    }
+
     fn on_focus_sub_issues(
         &mut self,
         _: &FocusSubIssues,
@@ -1133,6 +1186,7 @@ impl Render for IssueTracker {
             .on_action(cx.listener(Self::on_delete_issue))
             .on_action(cx.listener(Self::on_focus_filter))
             .on_action(cx.listener(Self::on_focus_tags))
+            .on_action(cx.listener(Self::on_focus_size))
             .on_action(cx.listener(Self::on_focus_sub_issues))
             .on_action(cx.listener(Self::on_cancel_editing))
             .on_action(cx.listener(Self::on_toggle_sidebar))

@@ -46,6 +46,8 @@ impl IssueTracker {
         let updated = issue.updated_at.format("%Y-%m-%d %H:%M").to_string();
         let progress = self.settled_progress(id, cx);
         let sub_issues = self.selected_sub_issues(cx);
+        let rollup =
+            issue_tracker::domain::SizeRollup::of(issue, &sub_issues.iter().collect::<Vec<_>>());
         let parent = self.selected_parent(cx);
         let sub_issue_count = sub_issues.len();
 
@@ -83,6 +85,7 @@ impl IssueTracker {
             .child(Input::new(&self.title_input))
             .child(self.render_status_row(status, progress, cx))
             .child(self.render_priority_row(priority, cx))
+            .child(self.render_size_row(rollup, sub_issues.len(), cx))
             .child(self.render_tag_editor(tags, cx))
             .child(self.render_relationships(sub_issues, parent, cx))
             .child(Textarea::new(&self.body_input))
@@ -128,6 +131,51 @@ impl IssueTracker {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.set_status(status, window, cx);
                     }))
+            }))
+    }
+
+    /// The Issue's own Size, and what the family comes to.
+    ///
+    /// A number rather than a row of buttons: a Size has 256 values, and it is
+    /// a judgement you type. The total is shown only when there are parts to
+    /// add up, and the sized-count beside it stops the figure reading as
+    /// complete when it is a lower bound.
+    fn render_size_row(
+        &self,
+        rollup: issue_tracker::domain::SizeRollup,
+        parts: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let summary = match (parts, rollup.total) {
+            (0, _) => None,
+            (parts, Some(total)) => Some(format!(
+                "total {total} · {} of {parts} part(s) sized",
+                parts - rollup.unsized_sub_issues
+            )),
+            (parts, None) => Some(format!("no part of {parts} is sized")),
+        };
+
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Size"),
+            )
+            .child(
+                div()
+                    .w(px(72.0))
+                    .child(Input::new(&self.size_input).small()),
+            )
+            .children(summary.map(|summary| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(summary)
             }))
     }
 

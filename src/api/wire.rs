@@ -8,9 +8,9 @@
 //! step, and `FromStr` already rejects anything else with a usable message.
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::domain::{Issue, IssueId, ParseError, Priority, Status, Tag};
+use crate::domain::{Issue, IssueId, ParseError, Priority, Size, SizeRollup, Status, Tag};
 use crate::projection::IssuePatch;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -20,6 +20,15 @@ pub struct IssueJson {
     pub body: String,
     pub status: String,
     pub priority: String,
+    /// This Issue's own Size. For a Parent, the work its parts do not cover.
+    pub size: Option<Size>,
+    /// Own Size plus its parts', or `null` when nothing in the family carries
+    /// one. Read-only and derived: a client cannot compute it, because it does
+    /// not hold the parts' Sizes.
+    pub total_size: Option<u32>,
+    /// How many parts have no Size. The number of parts is
+    /// `sub_issue_ids.len()`, so only this half needs sending.
+    pub unsized_sub_issues: usize,
     pub tags: Vec<String>,
     /// The Issue this one is part of. Read-only here: attach and detach go
     /// through `PUT`/`DELETE /issues/{parent}/sub-issues/{child}`.
@@ -44,12 +53,16 @@ impl IssueJson {
     /// numbers that go out are derived from one slice and cannot contradict
     /// each other.
     pub fn new(issue: &Issue, sub_issues: &[&Issue]) -> Self {
+        let rollup = SizeRollup::of(issue, sub_issues);
         Self {
             sub_issue_ids: sub_issues.iter().map(|child| child.id).collect(),
             settled_sub_issues: sub_issues
                 .iter()
                 .filter(|child| child.status.is_settled())
                 .count(),
+            size: issue.size,
+            total_size: rollup.total,
+            unsized_sub_issues: rollup.unsized_sub_issues,
             parent_id: issue.parent_id,
             id: issue.id,
             title: issue.title.clone(),
@@ -114,12 +127,38 @@ pub struct PatchIssue {
     pub priority: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Three states, which is why this is nested and not `Option<Size>`:
+    /// absent leaves the Size alone, an explicit `null` clears it, a number
+    /// sets it. `0` cannot mean "unsized" — it is a real Size meaning no work.
+    /// `Option<Size>` alone could not tell an absent key from a `null`, which
+    /// is the same trap `parent_id` sits beside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "present_but_maybe_null")]
+    pub size: Option<Option<Size>>,
     /// Present only so it can be *rejected* with a pointer to the right
     /// endpoint. Typed as a raw value because `Option<IssueId>` cannot tell an
     /// absent key from an explicit `null`, and silently ignoring an attempted
     /// re-parent would be a trap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<serde_json::Value>,
+}
+
+/// Distinguishes an absent key from an explicit `null`.
+///
+/// With `#[serde(default)]` an absent key never reaches this function and
+/// yields `None` — leave it alone. A key that *is* present does reach it, so a
+/// `null` becomes `Some(None)` — clear it — and a number becomes
+/// `Some(Some(n))`. Plain `Option<Option<T>>` collapses the first two into
+/// `None`, which is the whole problem.
+///
+/// Six lines rather than a dependency, for the same reason the HTTP client is
+/// hand-rolled.
+fn present_but_maybe_null<'de, D, T>(input: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(input).map(Some)
 }
 
 impl PatchIssue {
@@ -137,6 +176,7 @@ impl PatchIssue {
         };
 
         Ok(IssuePatch {
+            size: self.size,
             title: self.title,
             body: self.body,
             status: self
@@ -219,6 +259,7 @@ mod tests {
             priority: Priority::Urgent,
             tags: vec!["Bug".parse().unwrap()],
             parent_id: None,
+            size: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -236,5 +277,43 @@ mod tests {
         assert_eq!(json.settled_sub_issues, 1);
         // Round-trips back through the same parser the store uses.
         assert_eq!(json.status.parse::<Status>().unwrap(), Status::Cancelled);
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    fn patch(raw: &str) -> PatchIssue {
+        serde_json::from_str(raw).expect("a patch")
+    }
+
+    #[test]
+    fn a_patch_tells_absent_apart_from_null() {
+        // The distinction the whole nested Option exists for. `0` cannot
+        // stand in for "unsized": it is a real Size meaning no work.
+        assert_eq!(patch("{}").size, None, "absent leaves it alone");
+        assert_eq!(patch(r#"{"size":null}"#).size, Some(None), "null clears it");
+        assert_eq!(
+            patch(r#"{"size":7}"#).size,
+            Some(Some(7)),
+            "a number sets it"
+        );
+        assert_eq!(patch(r#"{"size":0}"#).size, Some(Some(0)), "zero is a size");
+    }
+
+    #[test]
+    fn a_size_outside_a_u8_is_refused_rather_than_clamped() {
+        // 255 is where an Issue should have become a tree of Issues.
+        assert!(serde_json::from_str::<PatchIssue>(r#"{"size":256}"#).is_err());
+        assert!(serde_json::from_str::<PatchIssue>(r#"{"size":-1}"#).is_err());
+    }
+
+    #[test]
+    fn the_three_states_survive_a_round_trip() {
+        for raw in ["{}", r#"{"size":null}"#, r#"{"size":7}"#] {
+            let there_and_back = serde_json::to_string(&patch(raw)).expect("serialisable");
+            assert_eq!(there_and_back, raw, "{raw}");
+        }
     }
 }

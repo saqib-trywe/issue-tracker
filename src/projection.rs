@@ -15,7 +15,9 @@ use std::fmt;
 
 use anyhow::Result;
 
-use crate::domain::{Issue, IssueId, Priority, Status, Tag, normalise_tags, sort_for_display};
+use crate::domain::{
+    Issue, IssueId, Priority, Size, Status, Tag, normalise_tags, sort_for_display,
+};
 use crate::store::Store;
 
 /// A write the data will not allow.
@@ -117,6 +119,12 @@ pub struct IssuePatch {
     /// Replaces the whole Tag set. Use [`Projection::add_tag`] to change one
     /// Tag without a read-modify-write.
     pub tags: Option<Vec<Tag>>,
+    /// Three states, which is why it is nested: absent leaves the Size alone,
+    /// `Some(None)` clears it, `Some(Some(n))` sets it. `0` cannot stand in
+    /// for "unsized" — it is a real Size meaning no work. Build it with
+    /// [`IssuePatch::size`] and [`IssuePatch::clear_size`] rather than by
+    /// hand, because `size(None)` would read like "leave it alone".
+    pub size: Option<Option<Size>>,
 }
 
 impl IssuePatch {
@@ -146,6 +154,17 @@ impl IssuePatch {
 
     pub fn tags(mut self, tags: Vec<Tag>) -> Self {
         self.tags = Some(tags);
+        self
+    }
+
+    pub fn size(mut self, size: Size) -> Self {
+        self.size = Some(Some(size));
+        self
+    }
+
+    /// Makes the Issue unsized again, which is not the same as sizing it zero.
+    pub fn clear_size(mut self) -> Self {
+        self.size = Some(None);
         self
     }
 }
@@ -344,6 +363,11 @@ impl Projection {
         }
         if let Some(tags) = patch.tags {
             issue.tags = normalise_tags(tags, &in_use);
+        }
+        // The outer `Some` says the patch mentioned Size at all; the inner one
+        // is the value, where `None` means unsize it.
+        if let Some(size) = patch.size {
+            issue.size = size;
         }
 
         if *issue == before {

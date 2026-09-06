@@ -48,6 +48,14 @@ Four rules are enforced by the tracker and will refuse your request if broken:
   tag), and are flat: \"ui/theme\" is a single name that happens to contain a
   slash, not a tag inside another.
 
+Sizes are optional and relative: a whole number from 0 to 255 whose unit is
+whatever you have been using. Nothing enforces the following, so it is on you to
+get right — an issue holding sub-issues is sized by adding their sizes to its
+own, so its own size means the work its parts do not cover, not the whole job.
+Putting the whole job on the parent double-counts it. A size of 0 means no work;
+leaving it unset means undecided, and setting it to null makes it undecided
+again.
+
 The tracker must be running for any of this to work. If it is not, every tool
 will say so, and the remedy is for the person to open it.";
 
@@ -110,6 +118,7 @@ impl Issues {
                 status: args.status.map(|status| status.0.label().to_string()),
                 priority: args.priority.map(|priority| priority.0.label().to_string()),
                 tags: args.tags,
+                size: args.size.map(Some),
                 ..Default::default()
             },
         };
@@ -127,6 +136,7 @@ impl Issues {
             body: args.body,
             status: args.status.map(|status| status.0.label().to_string()),
             priority: args.priority.map(|priority| priority.0.label().to_string()),
+            size: args.size,
             ..Default::default()
         };
         respond(operations::update(args.id, &patch)).await

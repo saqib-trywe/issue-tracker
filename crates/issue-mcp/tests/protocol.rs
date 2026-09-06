@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 
 const ISSUE: &str = r#"{"id":7,"title":"Fix the flash","body":"a long body","status":"Doing",
     "priority":"Urgent","tags":["ui"],"parent_id":null,"sub_issue_ids":[],"settled_sub_issues":0,
+    "size":null,"total_size":null,"unsized_sub_issues":0,
     "created_at":"2026-09-05T14:23:11.482913Z","updated_at":"2026-09-05T14:23:11.482913Z"}"#;
 
 /// A stub API: answers each connection with the next canned reply, and

@@ -606,8 +606,9 @@ components:
       type: object
       description: An Issue as it goes out. Every field is always present.
       required:
-        [id, title, body, status, priority, tags, parent_id, sub_issue_ids,
-         settled_sub_issues, created_at, updated_at]
+        [id, title, body, status, priority, size, total_size, tags, parent_id,
+         sub_issue_ids, settled_sub_issues, unsized_sub_issues, created_at,
+         updated_at]
       properties:
         id:
           $ref: '#/components/schemas/IssueId'
@@ -640,6 +641,42 @@ components:
             always empty.
           items:
             $ref: '#/components/schemas/IssueId'
+        size:
+          description: |
+            How big this work is, relative to other Issues — a whole number
+            from 0 to 255, whose unit you choose. `0` is a real Size meaning
+            no work; `null` means not decided yet, and the two are different.
+
+            For a Parent this is the work its parts do *not* cover, which is
+            why it adds to `total_size` rather than being replaced by it.
+
+            On `PATCH`, an absent key leaves it alone and an explicit `null`
+            clears it. Work that will not fit in 255 should be several Issues.
+          oneOf:
+            - type: integer
+              minimum: 0
+              maximum: 255
+            - type: 'null'
+        total_size:
+          description: >
+            This Issue's Size plus its sub-issues', or `null` when nothing in
+            the family carries one — distinct from `0`, which is a family that
+            adds up to no work. Read-only and derived; a client cannot compute
+            it, because it does not hold the sub-issues' Sizes. Settled
+            sub-issues still count. It is the whole total regardless of the
+            narrowing that produced the response.
+          oneOf:
+            - type: integer
+              minimum: 0
+            - type: 'null'
+        unsized_sub_issues:
+          type: integer
+          minimum: 0
+          description: >
+            How many sub-issues have no Size. The number of sub-issues is
+            `sub_issue_ids.len()`, so only this half is sent. A `total_size`
+            that silently omitted them would be a lower bound presented as an
+            answer.
         settled_sub_issues:
           type: integer
           minimum: 0
@@ -674,6 +711,9 @@ components:
           parent_id: null
           sub_issue_ids: [2, 3]
           settled_sub_issues: 1
+          size: 3
+          total_size: 16
+          unsized_sub_issues: 0
           created_at: '2026-09-05T09:14:02.481221Z'
           updated_at: '2026-09-05T09:20:44.010933Z'
 
@@ -699,6 +739,16 @@ components:
             already in use, so an existing spelling wins.
           items:
             type: string
+        size:
+          description: >
+            A number from 0 to 255 sets the Size; an explicit `null` clears it;
+            omitting the key leaves it alone. Three states, so `null` and
+            absent do not mean the same thing here.
+          oneOf:
+            - type: integer
+              minimum: 0
+              maximum: 255
+            - type: 'null'
 
     NewIssue:
       type: object
@@ -720,6 +770,11 @@ components:
           type: array
           items:
             type: string
+        size:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: At creation there is no need for `null` — absent already means unsized.
         parent_id:
           description: >
             The only place `parent_id` is writable. `PATCH` refuses it, so a

@@ -11,7 +11,7 @@ use gpui_component::{ActiveTheme, Side, Sizable};
 
 use super::tag_colour::colour_for;
 use super::tracker::{IssueTracker, LIST_CONTEXT};
-use issue_tracker::domain::{IssueId, Priority, Status, Tag};
+use issue_tracker::domain::{IssueId, Priority, SizeRollup, Status, Tag};
 
 impl IssueTracker {
     pub(super) fn render_issue_list(
@@ -34,6 +34,7 @@ impl IssueTracker {
                 tags: issue.tags.clone(),
                 parent_id: issue.parent_id,
                 progress: self.settled_progress(issue.id, cx),
+                total_size: SizeRollup::of(issue, &self.projection_sub_issues(issue.id, cx)).total,
             })
             .collect();
         let is_empty = visible.is_empty();
@@ -128,6 +129,7 @@ impl IssueTracker {
             tags,
             parent_id,
             progress,
+            total_size,
         } = row;
 
         div()
@@ -188,6 +190,11 @@ impl IssueTracker {
                     .when_some(progress, |this, (settled, total)| {
                         this.child(format!("{settled}/{total}"))
                     })
+                    // The total, not this Issue's own Size: a row should say
+                    // what the whole family comes to.
+                    .when_some(total_size, |this, total| {
+                        this.child(format!("\u{2211}{total}"))
+                    })
                     .when_some(parent_id, |this, parent| this.child(format!("↳ #{parent}")))
                     // Colour is most of why a Tag is legible here at all —
                     // without it these are more grey text competing with the
@@ -215,4 +222,6 @@ struct Row {
     parent_id: Option<IssueId>,
     /// Settled-over-total for this Issue's own parts, when it has any.
     progress: Option<(usize, usize)>,
+    /// What the whole family comes to, when anything in it is sized.
+    total_size: Option<u32>,
 }

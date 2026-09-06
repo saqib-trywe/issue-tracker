@@ -16,6 +16,17 @@ use chrono::{DateTime, Utc};
 /// Issues are identified by a sequential integer, shown to the user as `#42`.
 pub type IssueId = i64;
 
+/// How big a piece of work is, relative to the others.
+///
+/// Unitless on purpose — points, hours or afternoons, whichever you meant.
+/// `0` is a real answer meaning "no work", distinct from an absent Size, which
+/// means "not decided yet".
+///
+/// `u8` is the rule rather than a check beside it: an Issue that will not fit
+/// in 255 is not a large Issue, it is a tree of Issues that has not been
+/// written down yet.
+pub type Size = u8;
+
 /// Returned when a `TEXT` column holds a value outside the known set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -270,6 +281,12 @@ pub struct Issue {
     pub body: String,
     pub status: Status,
     pub priority: Priority,
+    /// How big this piece of work is on its own.
+    ///
+    /// For a Parent this is the work its parts do *not* cover — integration,
+    /// review, the bits that never became their own Issue — which is what
+    /// makes [`SizeRollup`] adding rather than double-counting.
+    pub size: Option<Size>,
     /// Sorted, and free of case-variant duplicates. Maintained through
     /// [`normalise_tags`].
     pub tags: Vec<Tag>,
@@ -472,6 +489,45 @@ impl Narrowing {
     }
 }
 
+/// An Issue's Size together with its parts'.
+///
+/// Derived on every read and never stored: a stored total is a second copy of
+/// something the Issues already say, and it goes wrong the moment a part is
+/// moved, deleted, or resized. Summing a few thousand Issues in memory is free.
+///
+/// Settled parts still count. A Size is a fact about the work, not about how
+/// much of it is left, so a Parent does not shrink as you finish it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeRollup {
+    /// The Issue's own Size plus its parts'. `None` when nothing in the family
+    /// carries one — distinct from `Some(0)`, which is a family that adds up
+    /// to no work.
+    pub total: Option<u32>,
+    /// How many parts have no Size. A total that silently omitted them would
+    /// be a lower bound presented as a figure.
+    pub unsized_sub_issues: usize,
+}
+
+impl SizeRollup {
+    /// Takes the parts themselves rather than a count, so the two numbers are
+    /// derived from one slice and cannot contradict each other.
+    pub fn of(issue: &Issue, sub_issues: &[&Issue]) -> Self {
+        let sizes = std::iter::once(issue.size).chain(sub_issues.iter().map(|part| part.size));
+
+        // Stays `None` until something is actually sized, which is what keeps
+        // "nothing is sized" distinct from "adds up to zero".
+        let mut total = None;
+        for size in sizes.flatten() {
+            total = Some(total.unwrap_or(0) + u32::from(size));
+        }
+
+        SizeRollup {
+            total,
+            unsized_sub_issues: sub_issues.iter().filter(|part| part.size.is_none()).count(),
+        }
+    }
+}
+
 /// Orders Issues for display: highest priority first, then most recently
 /// updated. Ties break on `id` so the order is never ambiguous.
 pub fn sort_for_display(issues: &mut [Issue]) {
@@ -508,6 +564,7 @@ mod tests {
             priority: Priority::None,
             tags: tags.iter().map(|tag| tag.parse().unwrap()).collect(),
             parent_id: None,
+            size: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -515,6 +572,86 @@ mod tests {
 
     fn ids(issues: Vec<&Issue>) -> Vec<IssueId> {
         issues.into_iter().map(|issue| issue.id).collect()
+    }
+
+    fn sized(id: IssueId, size: Option<Size>) -> Issue {
+        let mut issue = narrowable(id, "sized", Status::Todo, &[]);
+        issue.size = size;
+        issue
+    }
+
+    #[test]
+    fn a_family_with_no_sizes_at_all_has_no_total() {
+        // Distinct from a total of zero, which is a family that adds up to no
+        // work. Collapsing them would lose the only thing `Option` is for.
+        let parent = sized(1, None);
+        let parts = [sized(2, None), sized(3, None)];
+        let rollup = SizeRollup::of(&parent, &parts.iter().collect::<Vec<_>>());
+
+        assert_eq!(rollup.total, None);
+        assert_eq!(rollup.unsized_sub_issues, 2);
+    }
+
+    #[test]
+    fn a_size_of_zero_is_a_real_answer() {
+        let rollup = SizeRollup::of(&sized(1, Some(0)), &[]);
+        assert_eq!(rollup.total, Some(0), "no work is not the same as unknown");
+    }
+
+    #[test]
+    fn a_parents_own_size_adds_to_its_parts() {
+        // Its own Size is the work the parts do not cover, so it adds rather
+        // than replacing. See docs/adr/0011.
+        let parent = sized(1, Some(3));
+        let parts = [sized(2, Some(5)), sized(3, Some(8))];
+        let rollup = SizeRollup::of(&parent, &parts.iter().collect::<Vec<_>>());
+
+        assert_eq!(rollup.total, Some(16));
+        assert_eq!(rollup.unsized_sub_issues, 0);
+    }
+
+    #[test]
+    fn an_unsized_part_is_counted_rather_than_treated_as_zero() {
+        // A total that silently omitted it would be a lower bound presented
+        // as a figure.
+        let parent = sized(1, None);
+        let parts = [sized(2, Some(5)), sized(3, None), sized(4, Some(2))];
+        let rollup = SizeRollup::of(&parent, &parts.iter().collect::<Vec<_>>());
+
+        assert_eq!(rollup.total, Some(7));
+        assert_eq!(rollup.unsized_sub_issues, 1);
+    }
+
+    #[test]
+    fn a_settled_part_still_counts() {
+        // A Size is a fact about the work, not about how much is left: a
+        // Parent that shrank as you finished it would read as a bad estimate.
+        let parent = sized(1, None);
+        let mut done = sized(2, Some(5));
+        done.status = Status::Done;
+        let mut cancelled = sized(3, Some(2));
+        cancelled.status = Status::Cancelled;
+
+        let rollup = SizeRollup::of(&parent, &[&done, &cancelled]);
+        assert_eq!(rollup.total, Some(7));
+    }
+
+    #[test]
+    fn a_total_outgrows_the_type_a_size_is_held_in() {
+        // 255 is the ceiling for what a person types, not for what the
+        // arithmetic produces — which is why a total is `u32`.
+        let parent = sized(1, Some(u8::MAX));
+        let parts: Vec<Issue> = (2..12).map(|id| sized(id, Some(u8::MAX))).collect();
+        let rollup = SizeRollup::of(&parent, &parts.iter().collect::<Vec<_>>());
+
+        assert_eq!(rollup.total, Some(255 * 11));
+    }
+
+    #[test]
+    fn an_issue_with_no_parts_totals_to_its_own_size() {
+        assert_eq!(SizeRollup::of(&sized(1, Some(4)), &[]).total, Some(4));
+        assert_eq!(SizeRollup::of(&sized(1, None), &[]).total, None);
+        assert_eq!(SizeRollup::of(&sized(1, None), &[]).unsized_sub_issues, 0);
     }
 
     #[test]
@@ -661,6 +798,7 @@ mod tests {
             priority,
             tags: Vec::new(),
             parent_id: None,
+            size: None,
             created_at: at,
             updated_at: at,
         }

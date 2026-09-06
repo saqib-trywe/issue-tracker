@@ -553,6 +553,94 @@ mod tests {
     }
 
     #[test]
+    fn a_size_travels_and_a_null_takes_it_away() {
+        let mut p = projection();
+        let response = send(&mut p, "POST", "/issues", r#"{"title":"sized","size":7}"#);
+        assert_eq!(json(&response)["size"], 7);
+        let id = json(&response)["id"].as_i64().unwrap();
+
+        // Absent leaves it alone; the rest of the patch still applies.
+        let untouched = send(
+            &mut p,
+            "PATCH",
+            &format!("/issues/{id}"),
+            r#"{"status":"Doing"}"#,
+        );
+        assert_eq!(json(&untouched)["size"], 7);
+
+        // Zero is a real Size, not an absence.
+        let zeroed = send(&mut p, "PATCH", &format!("/issues/{id}"), r#"{"size":0}"#);
+        assert_eq!(json(&zeroed)["size"], 0);
+        assert_eq!(json(&zeroed)["total_size"], 0);
+
+        // An explicit null unsizes it.
+        let cleared = send(
+            &mut p,
+            "PATCH",
+            &format!("/issues/{id}"),
+            r#"{"size":null}"#,
+        );
+        assert_eq!(json(&cleared)["size"], serde_json::Value::Null);
+        assert_eq!(json(&cleared)["total_size"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_size_that_will_not_fit_is_refused() {
+        let mut p = projection();
+        // 255 is where an Issue should have become a tree of Issues.
+        assert_eq!(
+            send(&mut p, "POST", "/issues", r#"{"title":"huge","size":256}"#).status,
+            400
+        );
+        assert_eq!(
+            send(
+                &mut p,
+                "POST",
+                "/issues",
+                r#"{"title":"negative","size":-1}"#
+            )
+            .status,
+            400
+        );
+    }
+
+    #[test]
+    fn a_parents_total_adds_its_parts_and_says_what_is_missing() {
+        let mut p = projection();
+        let parent = make(&mut p, "parent");
+        let sized = make(&mut p, "sized");
+        let unmeasured = make(&mut p, "unsized");
+        p.set_parent(sized, Some(parent)).unwrap();
+        p.set_parent(unmeasured, Some(parent)).unwrap();
+        p.patch(parent, IssuePatch::default().size(3)).unwrap();
+        p.patch(sized, IssuePatch::default().size(5)).unwrap();
+
+        let response = send(&mut p, "GET", &format!("/issues/{parent}"), "");
+        assert_eq!(
+            json(&response)["size"],
+            3,
+            "the work its parts do not cover"
+        );
+        assert_eq!(json(&response)["total_size"], 8);
+        assert_eq!(json(&response)["unsized_sub_issues"], 1);
+
+        // The whole fraction regardless of the narrowing, as with progress.
+        let listed = send(&mut p, "GET", "/issues?parent=none", "");
+        assert_eq!(listed_ids(&listed).len(), 1, "the parts are hidden");
+        assert_eq!(json(&listed)[0]["total_size"], 8);
+        assert_eq!(json(&listed)[0]["unsized_sub_issues"], 1);
+    }
+
+    fn listed_ids(response: &Response) -> Vec<i64> {
+        json(response)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|issue| issue["id"].as_i64().unwrap())
+            .collect()
+    }
+
+    #[test]
     fn tags_are_added_and_removed_one_at_a_time() {
         let mut p = projection();
         let created = p.create("taggable", IssuePatch::default()).unwrap();

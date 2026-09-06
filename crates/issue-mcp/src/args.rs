@@ -11,7 +11,7 @@
 
 use std::str::FromStr;
 
-use issue_tracker::domain::{IssueId, Priority, Status};
+use issue_tracker::domain::{IssueId, Priority, Size, Status};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::Deserialize;
 use serde::de::{Error as _, Unexpected};
@@ -87,6 +87,16 @@ impl JsonSchema for PriorityArg {
     }
 }
 
+/// Tells an absent key apart from an explicit null, so an agent can unsize an
+/// issue as well as size it. See `api::wire` for the same helper on the wire.
+fn present_but_maybe_null<'de, D, T>(input: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(input).map(Some)
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ListIssues {
@@ -123,6 +133,10 @@ pub struct CreateIssue {
     /// Tags to attach. Accepted here because at creation there is nothing to
     /// clobber; afterwards use add_tag and remove_tag.
     pub tags: Option<Vec<String>>,
+    /// How big this work is, relative to other issues: a whole number from 0
+    /// to 255. 0 means no work; leaving it out means not decided yet. Work
+    /// that will not fit in 255 should be several issues instead.
+    pub size: Option<Size>,
     /// File this as a sub-issue of an existing issue. Accepted here because
     /// at creation "absent" unambiguously means "no parent"; afterwards use
     /// add_sub_issue.
@@ -139,6 +153,11 @@ pub struct UpdateIssue {
     pub body: Option<String>,
     pub status: Option<StatusArg>,
     pub priority: Option<PriorityArg>,
+    /// A whole number from 0 to 255 to size it, or null to make it unsized
+    /// again. Leaving the field out entirely leaves the size alone — null and
+    /// absent mean different things here.
+    #[serde(default, deserialize_with = "present_but_maybe_null")]
+    pub size: Option<Option<Size>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

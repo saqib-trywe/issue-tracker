@@ -45,6 +45,24 @@ Case-insensitive, so `Bug` and `bug` are one Tag. Flat — `ui/theme` is a name
 that happens to contain a slash, not a child of `ui`.
 _Avoid_: Label, Category, Topic, Keyword
 
+**Size**:
+How big a piece of work is, relative to the others. A whole number you choose
+the meaning of — points, hours, afternoons — so the tracker never interprets
+it. Zero is a real answer meaning no work, and is different from having no Size
+at all, which means not decided yet. Work that will not fit in 255 is not a
+large Issue; it is a tree of Issues that has not been written down yet.
+_Avoid_: Estimate, Points, Effort, Weight, Complexity
+
+**Total size**:
+An Issue's Size together with its Sub-issues'. A Parent's own Size is the work
+its parts do *not* cover — integration, review, the bits that never became
+their own Issue — which is why the two add rather than one replacing the other.
+Settled parts still count: a Size describes the work, not how much is left, so
+a Parent does not shrink as you finish it. A total says how many parts are
+still unsized, because a figure that quietly omitted them would be a lower
+bound presented as an answer.
+_Avoid_: Rollup, Aggregate, Sum
+
 **Sub-issue**:
 An Issue that is part of another Issue. Exactly one level deep: a Sub-issue has
 no Sub-issues of its own, and belongs to at most one Parent. Being a Sub-issue

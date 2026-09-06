@@ -8,7 +8,7 @@
 
 use std::ffi::OsString;
 
-use crate::domain::{IssueId, ParentFilter, Priority, Status, Tag};
+use crate::domain::{IssueId, ParentFilter, Priority, Size, Status, Tag};
 
 use super::Failure;
 
@@ -46,6 +46,8 @@ pub struct NewIssue {
     /// see the note on [`Changes`].
     pub tags: Vec<Tag>,
     pub parent: Option<IssueId>,
+    /// No `none` here: at creation, absent already means unsized.
+    pub size: Option<Size>,
 }
 
 /// The fields `issue set` may change.
@@ -60,14 +62,28 @@ pub struct Changes {
     pub body: Option<Body>,
     pub status: Option<Status>,
     pub priority: Option<Priority>,
+    /// Three states, as on the wire: absent leaves the Size alone,
+    /// `--size none` clears it, `--size 5` sets it.
+    pub size: Option<Option<Size>>,
 }
 
 impl Changes {
+    /// Every field, so that adding one and forgetting this cannot turn a real
+    /// change into "nothing to set" — which is what happened when `--size`
+    /// arrived: `--size 0` and `--size none` were both refused as empty.
     pub fn is_empty(&self) -> bool {
-        self.title.is_none()
-            && self.body.is_none()
-            && self.status.is_none()
-            && self.priority.is_none()
+        let Changes {
+            title,
+            body,
+            status,
+            priority,
+            size,
+        } = self;
+        title.is_none()
+            && body.is_none()
+            && status.is_none()
+            && priority.is_none()
+            && size.is_none()
     }
 }
 
@@ -241,6 +257,9 @@ fn new(mut args: pico_args::Arguments) -> Result<Command, Failure> {
     let parent = value(&mut args, "--parent")?
         .map(|raw| id_from(&raw))
         .transpose()?;
+    let size = value(&mut args, "--size")?
+        .map(|raw| size_from(&raw))
+        .transpose()?;
 
     let mut free = rest(args, 1, "new")?;
     let title = free.remove(0);
@@ -255,6 +274,7 @@ fn new(mut args: pico_args::Arguments) -> Result<Command, Failure> {
         priority,
         tags,
         parent,
+        size,
     })))
 }
 
@@ -267,6 +287,12 @@ fn set(mut args: pico_args::Arguments) -> Result<Command, Failure> {
     let priority = value(&mut args, "--priority")?
         .map(|raw| parse_as::<Priority>(&raw))
         .transpose()?;
+    // `none` unsizes, matching `--parent none`. Absent leaves it alone.
+    let size = match value(&mut args, "--size")? {
+        None => None,
+        Some(raw) if raw == "none" => Some(None),
+        Some(raw) => Some(Some(size_from(&raw)?)),
+    };
     let id = one_id(args, "set")?;
 
     let changes = Changes {
@@ -274,12 +300,14 @@ fn set(mut args: pico_args::Arguments) -> Result<Command, Failure> {
         body,
         status,
         priority,
+        size,
     };
     // An empty PATCH is a valid no-op to the API, so it would exit 0 having
     // done nothing that was asked for. That is worth refusing.
     if changes.is_empty() {
         return Err(Failure::usage(
-            "nothing to set. Give at least one of --title, --body, --status, --priority",
+            "nothing to set. Give at least one of --title, --body, --status, \
+             --priority, --size",
         ));
     }
 
@@ -349,6 +377,19 @@ where
     T::Err: std::fmt::Display,
 {
     raw.parse().map_err(|err| Failure::usage(format!("{err}")))
+}
+
+/// A Size, refused rather than clamped when it will not fit.
+///
+/// The ceiling is the point: work that does not fit in 255 is not one large
+/// Issue, it is a tree of Issues nobody has written down yet.
+fn size_from(raw: &str) -> Result<Size, Failure> {
+    raw.parse().map_err(|_| {
+        Failure::usage(format!(
+            "a size is a whole number from 0 to {}: {raw}",
+            Size::MAX
+        ))
+    })
 }
 
 fn id_from(raw: &str) -> Result<IssueId, Failure> {
@@ -489,6 +530,33 @@ mod tests {
 
     #[test]
     fn a_body_may_come_from_stdin() {
+        // A change that only touches the Size is still a change. `--size 0`
+        // sets it to zero, which is a real Size, and `--size none` unsizes it.
+        let Command::Set(_, changes) = command("set 7 --size 0") else {
+            panic!("expected a set")
+        };
+        assert_eq!(changes.size, Some(Some(0)));
+
+        let Command::Set(_, changes) = command("set 7 --size none") else {
+            panic!("expected a set")
+        };
+        assert_eq!(changes.size, Some(None));
+
+        let Command::Set(_, changes) = command("set 7 --status done") else {
+            panic!("expected a set")
+        };
+        assert_eq!(changes.size, None, "absent leaves the size alone");
+
+        assert!(usage("set 7 --size 256").contains("255"));
+        assert!(usage("set 7 --size half").contains("half"));
+
+        let Command::New(new) = command("new title --size 4") else {
+            panic!("expected a new")
+        };
+        assert_eq!(new.size, Some(4));
+        // At creation there is no `none`: absent already means unsized.
+        assert!(usage("new title --size none").contains("none"));
+
         let Command::New(new) = command("new title --body -") else {
             panic!()
         };

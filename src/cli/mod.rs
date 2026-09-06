@@ -60,6 +60,8 @@ NEW AND SET OPTIONS
   --body <text|->             \"-\" reads the body from standard input
   --status <status>
   --priority <priority>       {priorities}
+  --size <n|none>             Relative size, 0-255. `none` unsizes; `new`
+                              takes a number only
   --tag <name>                new only, repeatable. Use `issue tag` to change
                               the tags of an issue that already exists
   --parent <id>               new only
@@ -413,6 +415,7 @@ fn new_issue(new: NewIssue) -> Result<NewIssueBody, Failure> {
                 true => None,
                 false => Some(new.tags.iter().map(|tag| tag.as_str().to_owned()).collect()),
             },
+            size: new.size.map(Some),
             ..Default::default()
         },
     })
@@ -426,6 +429,7 @@ fn patch(changes: Changes) -> Result<PatchIssue, Failure> {
         priority: changes
             .priority
             .map(|priority| priority.label().to_string()),
+        size: changes.size,
         ..Default::default()
     })
 }
@@ -555,6 +559,7 @@ mod tests {
             priority: Some(Priority::High),
             tags: vec![tag("ui")],
             parent: Some(3),
+            size: Some(5),
         })
         .expect("no stdin needed");
 
@@ -564,6 +569,7 @@ mod tests {
         assert_eq!(body.rest.status.as_deref(), Some("Doing"));
         assert_eq!(body.rest.priority.as_deref(), Some("High"));
         assert_eq!(body.rest.tags, Some(vec!["ui".to_string()]));
+        assert_eq!(body.rest.size, Some(Some(5)));
     }
 
     #[test]
@@ -577,11 +583,13 @@ mod tests {
             priority: None,
             tags: Vec::new(),
             parent: None,
+            size: None,
         })
         .expect("no stdin needed");
 
         assert_eq!(body.rest.tags, None);
         assert_eq!(body.rest.status, None);
+        assert_eq!(body.rest.size, None, "absent, not sized zero");
         assert_eq!(body.parent_id, None);
     }
 
@@ -592,6 +600,7 @@ mod tests {
             body: None,
             status: Some(Status::Cancelled),
             priority: None,
+            size: None,
         })
         .expect("no stdin needed");
 
@@ -601,6 +610,27 @@ mod tests {
         assert_eq!(changed.priority, None);
         // The field that exists only to be rejected must never be sent.
         assert!(changed.parent_id.is_none());
+    }
+
+    #[test]
+    fn setting_a_size_and_clearing_one_are_different_patches() {
+        let sized = patch(Changes {
+            size: Some(Some(8)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(serde_json::to_string(&sized).unwrap(), r#"{"size":8}"#);
+
+        let cleared = patch(Changes {
+            size: Some(None),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&cleared).unwrap(),
+            r#"{"size":null}"#,
+            "`--size none` has to reach the wire as an explicit null"
+        );
     }
 
     #[test]
