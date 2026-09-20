@@ -107,6 +107,17 @@ pub struct NewIssue {
     pub parent_id: Option<IssueId>,
     #[serde(flatten)]
     pub rest: PatchIssue,
+    /// Whatever the body said that nothing above claimed, so `create_issue`
+    /// can refuse it.
+    ///
+    /// `PatchIssue` says `deny_unknown_fields` and that is enough for `PATCH`,
+    /// but a flattened struct never sees the keys it did not match — serde
+    /// hands them to the outer type — so the same `deny` is silently inert
+    /// here. Catching them is the only way `POST` can refuse what `PATCH`
+    /// refuses. Empty is the normal case, and an empty map serialises to
+    /// nothing, so a body built by a client is unchanged by its presence.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 /// `PATCH /issues/{id}`. An absent field is left alone; this is what stops a
@@ -115,7 +126,13 @@ pub struct NewIssue {
 /// Every field skips serialising when absent. Without that, a patch built by
 /// a client would send `"title": null` for a field it does not touch, and
 /// "names only what it changes" would be true only by accident.
+///
+/// Unknown fields are refused rather than ignored, for the reason the CLI
+/// calls `finish()` and the MCP server's arguments say the same thing: without
+/// it, `PATCH {"statuss": "Done"}` answers `200 OK` and changes nothing, which
+/// is the one failure a caller cannot see.
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PatchIssue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,

@@ -147,6 +147,10 @@ paths:
         It is applied after the Issue is created and goes through exactly the
         checks an attach would, so a refusal leaves the Issue filed but
         unparented.
+
+        A field this endpoint does not know is refused rather than ignored. A
+        misspelt one answering `201` and quietly dropping what it carried is
+        the one mistake a caller has no way to see.
       requestBody:
         required: true
         content:
@@ -182,7 +186,7 @@ paths:
         '400':
           description: |
             A blank title, an unknown Status, Priority or unusable Tag name,
-            or a malformed body.
+            a field this endpoint does not know, or a malformed body.
           content:
             application/json:
               schema:
@@ -243,6 +247,10 @@ paths:
         `tags` is the exception to field-level safety: it **replaces** the
         whole set. Changing one Tag through it is a read-modify-write, which
         is what `PUT`/`DELETE /issues/{id}/tags/{name}` exists to avoid.
+
+        A field this endpoint does not know is refused rather than ignored.
+        `{"statuss": "Done"}` answering `200` and changing nothing is the one
+        mistake a caller has no way to see.
       requestBody:
         required: false
         content:
@@ -267,11 +275,11 @@ paths:
                 $ref: '#/components/schemas/Issue'
         '400':
           description: >
-            An unknown Status or Priority, an unusable Tag name, a malformed
-            body, or `parent_id` — which is refused with a pointer to the
-            sub-issue endpoints rather than ignored, since a caller who
-            thought they had moved an Issue would otherwise have no way to
-            tell they had not.
+            An unknown Status or Priority, an unusable Tag name, a field this
+            endpoint does not know, a malformed body, or `parent_id` — which
+            is refused with a pointer to the sub-issue endpoints rather than
+            ignored, since a caller who thought they had moved an Issue would
+            otherwise have no way to tell they had not.
           content:
             application/json:
               schema:

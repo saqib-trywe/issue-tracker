@@ -418,6 +418,7 @@ fn new_issue(new: NewIssue) -> Result<NewIssueBody, Failure> {
             size: new.size.map(Some),
             ..Default::default()
         },
+        ..Default::default()
     })
 }
 

@@ -121,6 +121,7 @@ impl Issues {
                 size: args.size.map(Some),
                 ..Default::default()
             },
+            ..Default::default()
         };
         respond(operations::create(&new)).await
     }

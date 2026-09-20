@@ -169,6 +169,13 @@ fn create_issue(request: &Request, projection: &mut Projection) -> Response {
             "use \"parent_id\" at the top level of the body, not inside a patch",
         );
     }
+    // `PatchIssue` refuses these itself, but a flattened struct never sees the
+    // keys it did not match, so for `POST` they arrive here instead. Refused
+    // for the same reason: a create that silently dropped `"tagz"` reports
+    // success and files an untagged Issue.
+    if let Some(unknown) = new.unknown.keys().next() {
+        return Response::error(400, format!("unknown field `{unknown}`"));
+    }
     let patch = match new.rest.into_patch() {
         Ok(patch) => patch,
         Err(err) => return Response::error(400, err),
@@ -385,6 +392,46 @@ mod tests {
             400
         );
         assert_eq!(send(&mut p, "POST", "/issues", "{}").status, 400);
+    }
+
+    /// The failure the CLI's `finish()` and the MCP server's
+    /// `deny_unknown_fields` exist to prevent, at the surface both of them are
+    /// clients of: a misspelt field answering 200 and changing nothing is the
+    /// one mistake a caller has no way to see.
+    #[test]
+    fn a_misspelt_field_is_refused_rather_than_ignored() {
+        let mut p = projection();
+        let id = make(&mut p, "unchanged");
+
+        let response = send(
+            &mut p,
+            "PATCH",
+            &format!("/issues/{id}"),
+            r#"{"statuss":"Done"}"#,
+        );
+
+        assert_eq!(response.status, 400);
+        assert!(
+            json(&response)["error"]
+                .as_str()
+                .unwrap()
+                .contains("statuss"),
+            "the message names the offending field"
+        );
+        assert_eq!(p.get(id).unwrap().status, Status::Todo);
+    }
+
+    /// `POST` needs its own guard: `PatchIssue` arrives flattened, and a
+    /// flattened struct never sees the keys it did not match.
+    #[test]
+    fn a_misspelt_field_is_refused_when_creating_too() {
+        let mut p = projection();
+
+        let response = send(&mut p, "POST", "/issues", r#"{"title":"t","tagz":["ui"]}"#);
+
+        assert_eq!(response.status, 400);
+        assert!(json(&response)["error"].as_str().unwrap().contains("tagz"));
+        assert!(p.issues().is_empty(), "nothing was written");
     }
 
     #[test]

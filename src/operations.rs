@@ -299,6 +299,7 @@ mod tests {
                 tags: Some(vec!["ui".into()]),
                 ..Default::default()
             },
+            ..Default::default()
         });
         assert_eq!(call.path, "/issues");
         assert_eq!(
