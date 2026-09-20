@@ -25,6 +25,11 @@ info:
     `{"error": "<one human-readable sentence>"}`. The server writes
     `Connection: close` and serves one request per connection.
 
+    A request body must be framed with `Content-Length`; `Transfer-Encoding:
+    chunked` is refused with `400` rather than read as an empty body, so a
+    client that sends one is told what went wrong instead of being told its
+    `title` was missing.
+
     ## Finding the server
 
     The port and token are published to `api.json`, beside the database, mode

@@ -76,6 +76,14 @@ pub fn parse(buffer: &[u8]) -> Parsed {
         })
         .collect();
 
+    // Only `Content-Length` delimits a body here. Said rather than assumed:
+    // a chunked body would otherwise be read as no body at all, and the
+    // caller would be told their `title` was missing rather than that their
+    // body never arrived.
+    if headers.iter().any(|(key, _)| key == "transfer-encoding") {
+        return Parsed::Malformed("chunked bodies are not supported; send Content-Length");
+    }
+
     let content_length = match headers.iter().find(|(key, _)| key == "content-length") {
         Some((_, value)) => match value.parse::<usize>() {
             Ok(length) => length,
@@ -274,6 +282,19 @@ mod tests {
             MAX_BODY + 1
         );
         assert!(matches!(parse(raw.as_bytes()), Parsed::Malformed(_)));
+    }
+
+    /// Without this a chunked `POST` parses as a request with no body at all,
+    /// and the caller is told their `title` is missing when what actually
+    /// happened is that nothing here knows how to read what they sent.
+    #[test]
+    fn a_chunked_body_is_refused_in_terms_of_what_went_wrong() {
+        let raw = "POST /issues HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+                   Transfer-Encoding: chunked\r\n\r\n1e\r\n{\"title\":\"filed by a stranger\"}\r\n0\r\n\r\n";
+        match parse(raw.as_bytes()) {
+            Parsed::Malformed(why) => assert!(why.contains("chunked"), "{why}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]
