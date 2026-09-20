@@ -181,13 +181,26 @@ fn create_issue(request: &Request, projection: &mut Projection) -> Response {
         Err(err) => return Response::error(400, err),
     };
 
+    // Asked before anything is written. Every reason a parent could refuse
+    // this Issue is a fact about the parent, so it is knowable now — and
+    // checking afterwards meant answering 404 to a caller who had just been
+    // given an Issue they were never told about.
+    if let Some(parent) = new.parent_id {
+        let settled = patch.status.unwrap_or_default().is_settled();
+        if let Err(err) = projection.may_hold(parent, settled) {
+            return write_error(err);
+        }
+    }
+
     let created = match projection.create(&title, patch) {
         Ok(issue) => issue,
         Err(err) => return write_error(err),
     };
 
-    // Applied after creation so it goes through exactly the checks an attach
-    // would; a refusal here leaves the Issue created but unparented.
+    // Still routed through `set_parent` so the attach goes through exactly the
+    // checks any other attach does. It cannot refuse now: the Issue is new, so
+    // it is neither its own parent nor holding anything, and the parent was
+    // asked above.
     if let Some(parent) = new.parent_id
         && let Err(err) = projection.set_parent(created.id, Some(parent))
     {
@@ -983,6 +996,49 @@ mod tests {
 
         assert_eq!(response.status, 201);
         assert_eq!(json(&response)["parent_id"], parent);
+    }
+
+    /// A refusal that also created something is a refusal a caller cannot act
+    /// on: retrying files the Issue twice, and the response never mentioned
+    /// the first one.
+    #[test]
+    fn a_create_refused_by_its_parent_creates_nothing() {
+        let mut p = projection();
+        let held = make(&mut p, "already a sub-issue");
+        let parent = make(&mut p, "parent");
+        send(
+            &mut p,
+            "PUT",
+            &format!("/issues/{parent}/sub-issues/{held}"),
+            "",
+        );
+        let before = p.issues().len();
+
+        // A parent that is itself a sub-issue: one level deep, so refused.
+        let response = send(
+            &mut p,
+            "POST",
+            "/issues",
+            &format!(r#"{{"title":"grandchild","parent_id":{held}}}"#),
+        );
+
+        assert_eq!(response.status, 409);
+        assert_eq!(p.issues().len(), before, "nothing was written");
+    }
+
+    #[test]
+    fn a_create_naming_a_parent_that_does_not_exist_creates_nothing() {
+        let mut p = projection();
+
+        let response = send(
+            &mut p,
+            "POST",
+            "/issues",
+            r#"{"title":"orphan","parent_id":404}"#,
+        );
+
+        assert_eq!(response.status, 404);
+        assert!(p.issues().is_empty(), "nothing was written");
     }
 
     #[test]

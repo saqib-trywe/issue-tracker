@@ -144,9 +144,9 @@ paths:
 
         `parent_id` is accepted **here** — at creation "absent" unambiguously
         means "no parent", which is the ambiguity that keeps it out of `PATCH`.
-        It is applied after the Issue is created and goes through exactly the
-        checks an attach would, so a refusal leaves the Issue filed but
-        unparented.
+        Every reason a parent could refuse is a fact about the parent, so it is
+        checked *before* anything is written: a refused create files nothing,
+        and a retry cannot leave two Issues behind.
 
         A field this endpoint does not know is refused rather than ignored. A
         misspelt one answering `201` and quietly dropping what it carried is
@@ -196,15 +196,15 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
-          description: The named `parent_id` does not exist. The Issue was still created.
+          description: The named `parent_id` does not exist. Nothing was created.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '409':
           description: >
-            The named parent is itself a sub-issue, or is Done or Cancelled.
-            The Issue was still created, unparented.
+            The named parent is itself a sub-issue, or is Done and this Issue
+            would not be settled. Nothing was created.
           content:
             application/json:
               schema:
@@ -294,8 +294,10 @@ paths:
           description: |
             The change is refused by a rule. Both directions of the completion
             rule land here: a parent cannot go Done above outstanding
-            sub-issues, and a sub-issue cannot be reopened under a settled
-            parent. Done and Cancelled both count as settled.
+            sub-issues, and a sub-issue cannot be reopened under a **Done**
+            parent. Done and Cancelled both settle a *child*, but only Done
+            constrains a parent — cancelling a parent is never blocked, and
+            never blocks its parts.
           content:
             application/json:
               schema:
@@ -444,8 +446,9 @@ paths:
             * the hierarchy is exactly one level deep, refused from both ends
               — a sub-issue cannot take children, and an Issue that has
               children cannot become one;
-            * an outstanding child cannot be attached under a settled parent,
-              nor a child attached to a parent already Done.
+            * a parent that is **Done** cannot take on a child that is still
+              outstanding. Only Done constrains a parent here; a Cancelled
+              one takes work as any other Issue does.
           content:
             application/json:
               schema:

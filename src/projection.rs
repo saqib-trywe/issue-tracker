@@ -247,6 +247,36 @@ impl Projection {
         self.outstanding_count(id) == 0
     }
 
+    /// Whether `parent` may take on a part, given whether that part is
+    /// settled — the half of the attachment rules that is about the parent.
+    ///
+    /// Split out because it is everything answerable *before the child
+    /// exists*, which is what `POST /issues` with a `parent_id` needs. Asking
+    /// afterwards means creating an Issue in order to discover the request was
+    /// refused, and answering 404 to a caller who now owns something they were
+    /// never told about.
+    pub(crate) fn may_hold(
+        &self,
+        parent: IssueId,
+        child_is_settled: bool,
+    ) -> std::result::Result<(), WriteError> {
+        let Some(target) = self.get(parent) else {
+            return Err(WriteError::NotFound(parent));
+        };
+
+        // One level deep, this end of it.
+        if target.parent_id.is_some() {
+            return Err(Refused::ParentIsSubIssue(parent).into());
+        }
+
+        // A Done parent may not take on work that is still outstanding.
+        if target.status == Status::Done && !child_is_settled {
+            return Err(Refused::ParentAlreadyDone(parent).into());
+        }
+
+        Ok(())
+    }
+
     /// Whether `child` may be attached under `parent`, and why not.
     ///
     /// The single statement of the attachment rules. [`Self::set_parent`]
@@ -257,30 +287,20 @@ impl Projection {
     /// itself a sub-issue, and was correct only because the detail pane
     /// declines to show that picker.
     fn may_attach(&self, child: IssueId, parent: IssueId) -> std::result::Result<(), WriteError> {
-        if self.get(child).is_none() {
+        let Some(issue) = self.get(child) else {
             return Err(WriteError::NotFound(child));
-        }
+        };
         if parent == child {
             return Err(Refused::SelfParent.into());
         }
-        let Some(target) = self.get(parent) else {
-            return Err(WriteError::NotFound(parent));
-        };
 
-        // One level deep, checked from both ends.
-        if target.parent_id.is_some() {
-            return Err(Refused::ParentIsSubIssue(parent).into());
-        }
+        // The parent's half first, so a parent that is not there is reported
+        // as such rather than behind something about the child.
+        self.may_hold(parent, issue.status.is_settled())?;
+
+        // One level deep, the other end of it.
         if !self.sub_issues(child).is_empty() {
             return Err(Refused::ChildHasSubIssues(child).into());
-        }
-
-        // A Done parent may not take on work that is still outstanding.
-        let child_settled = self
-            .get(child)
-            .is_some_and(|issue| issue.status.is_settled());
-        if target.status == Status::Done && !child_settled {
-            return Err(Refused::ParentAlreadyDone(parent).into());
         }
 
         Ok(())
@@ -913,6 +933,28 @@ mod tests {
         assert!(
             p.patch(children[0], IssuePatch::default().status(Status::Cancelled))
                 .is_ok()
+        );
+    }
+
+    /// Only Done constrains a parent. Cancelling is a decision about the
+    /// parent's own work, not a claim that everything beneath it is finished,
+    /// so it neither blocks nor is blocked — which is what the glossary means
+    /// by cancelling a Parent never being blocked. The spec said "Done or
+    /// Cancelled" in two places while the code said Done; this pins which.
+    #[test]
+    fn a_cancelled_parent_takes_work_as_any_other_issue_does() {
+        let mut p = projection();
+        let parent = p
+            .create("abandoned", IssuePatch::default().status(Status::Cancelled))
+            .unwrap()
+            .id;
+        let open = p.create("still wanted", IssuePatch::default()).unwrap().id;
+
+        assert!(p.set_parent(open, Some(parent)).is_ok());
+        assert!(
+            p.patch(open, IssuePatch::default().status(Status::Doing))
+                .is_ok(),
+            "and it can still be moved along underneath"
         );
     }
 
