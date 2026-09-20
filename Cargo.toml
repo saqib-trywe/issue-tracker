@@ -1,5 +1,5 @@
 [package]
-name = "gpui-issue-tracker-ui"
+name = "issue-tracker"
 version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-only"
@@ -14,7 +14,9 @@ members = ["crates/issue-mcp"]
 
 # The shared core: domain rules, storage, the projection and the HTTP API.
 # It deliberately does not contain `ui` or `app_state`, so nothing in here can
-# reach back into the view — see docs/adr/0008.
+# reach back into the view — see docs/adr/0008. The name matches the package's
+# own, but is written out because every `use issue_tracker::` in `src/ui/`
+# depends on it, not on whatever the package is called this week.
 [lib]
 name = "issue_tracker"
 path = "src/lib.rs"

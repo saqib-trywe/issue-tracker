@@ -1,6 +1,6 @@
 # Own SQLite store rather than a GitHub or GitLab client
 
-The crate is named `gpui-issue-tracker-ui`, which invites the assumption that
+The crate is named `issue-tracker`, which invites the assumption that
 it fronts an existing tracker — it does not. This app owns its data in a local
 SQLite database, with no network layer, no auth, and exactly one user.
 

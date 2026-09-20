@@ -10,9 +10,8 @@ name = "issue-mcp"
 path = "src/main.rs"
 
 [dependencies]
-# The library half of the tracker: the HTTP client and the domain types. The
-# package is named for the app; its library target is `issue_tracker`.
-gpui-issue-tracker-ui = { path = "../.." }
+# The library half of the tracker: the HTTP client and the domain types.
+issue-tracker = { path = "../.." }
 
 # `server` and `macros` are on by default; `transport-io` is what gives stdio.
 rmcp = { version = "3.2", features = ["transport-io"] }

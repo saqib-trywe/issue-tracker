@@ -41,7 +41,7 @@ info:
     ```
 
     On macOS that is
-    `~/Library/Application Support/gpui-issue-tracker/api.json`, or beside
+    `~/Library/Application Support/issue-tracker/api.json`, or beside
     whatever `ISSUE_TRACKER_DB` names. Port 8787 is only preferred: if it is
     taken, an ephemeral port is used, which is why the file is authoritative.
 

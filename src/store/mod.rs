@@ -221,7 +221,7 @@ pub fn db_path() -> Result<PathBuf> {
         return Ok(PathBuf::from(override_path));
     }
 
-    let dirs = directories::ProjectDirs::from("", "", "gpui-issue-tracker")
+    let dirs = directories::ProjectDirs::from("", "", "issue-tracker")
         .context("locating the platform data directory")?;
     Ok(dirs.data_dir().join("issues.db"))
 }

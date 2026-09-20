@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`gpui-issue-tracker-ui` — a single-user desktop issue tracker built with [GPUI](https://github.com/zed-industries/zed) (Zed's UI framework) and the [gpui-component](https://github.com/longbridge/gpui-component) widget library. It owns its data in a local SQLite database; it is not a client for GitHub or GitLab.
+`issue-tracker` — a single-user desktop issue tracker built with [GPUI](https://github.com/zed-industries/zed) (Zed's UI framework) and the [gpui-component](https://github.com/longbridge/gpui-component) widget library. It owns its data in a local SQLite database; it is not a client for GitHub or GitLab.
 
 Read `CONTEXT.md` for the domain vocabulary and `docs/adr/` for the decisions that shaped the architecture.
 
@@ -26,7 +26,7 @@ Set `ISSUE_TRACKER_DB` to point at a scratch database when developing, so experi
 ISSUE_TRACKER_DB=/tmp/it-scratch.db cargo run
 ```
 
-Without it, the database lives in the platform data directory (`~/Library/Application Support/gpui-issue-tracker/issues.db` on macOS).
+Without it, the database lives in the platform data directory (`~/Library/Application Support/issue-tracker/issues.db` on macOS).
 
 ## Architecture
 
