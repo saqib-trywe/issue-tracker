@@ -23,8 +23,15 @@ impl IssueTracker {
         // Collected into owned rows first: the Issues are borrowed from the
         // shared Projection through `cx`, and building elements needs `cx`
         // mutably. Only what a row displays is cloned — never the body.
+        //
+        // Both of the per-row hierarchy answers come from one index, built
+        // once here. Asking the Projection per row meant two scans of the
+        // whole corpus for every row painted.
+        let projection = self.projection(cx);
+        let sub_issues = projection.sub_issue_index();
         let visible: Vec<Row> = self
-            .visible_issues(cx)
+            .working
+            .visible(projection.issues())
             .into_iter()
             .map(|issue| Row {
                 id: issue.id,
@@ -33,8 +40,8 @@ impl IssueTracker {
                 priority: issue.priority,
                 tags: issue.tags.clone(),
                 parent_id: issue.parent_id,
-                progress: self.settled_progress(issue.id, cx),
-                total_size: SizeRollup::of(issue, &self.projection_sub_issues(issue.id, cx)).total,
+                progress: sub_issues.settled_progress(issue.id),
+                total_size: SizeRollup::of(issue, sub_issues.of_issue(issue.id)).total,
             })
             .collect();
         let is_empty = visible.is_empty();

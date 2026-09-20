@@ -324,8 +324,7 @@ impl IssueTracker {
                 |this, input, event: &InputEvent, window, cx| {
                     if matches!(event, InputEvent::Change) {
                         let text = input.read(cx).value().to_string();
-                        let issues = this.projection_issues(cx);
-                        this.working.set_filter(text, &issues);
+                        this.settling(cx, |working, issues| working.set_filter(text, issues));
                         this.after_settling(true, window, cx);
                     }
                 },
@@ -452,17 +451,33 @@ impl IssueTracker {
 
     // ---- projection queries -------------------------------------------------
 
-    /// Every Issue, in display order. The corpus [`WorkingState`] narrows.
-    pub(super) fn projection_issues(&self, cx: &App) -> Vec<Issue> {
-        self.projection.read(cx).issues().to_vec()
+    /// The shared Projection, borrowed for as long as `cx` is.
+    ///
+    /// The render paths read the corpus through this and ask it everything
+    /// they need from one borrow. Anything that also has to take `&mut self`
+    /// — every working-state change — goes through [`Self::settling`]
+    /// instead, because this borrow would block it.
+    pub(super) fn projection<'a>(&self, cx: &'a App) -> &'a Projection {
+        self.projection.read(cx)
     }
 
-    /// The Issues this window is showing, in display order.
+    /// Runs a working-state change against the shared corpus.
+    ///
+    /// The *handle* is cloned — a pointer, not the Issues — so the borrow of
+    /// the corpus is of `cx` alone and leaves `self.working` free to be taken
+    /// mutably beside it. This used to clone the Issues themselves to dodge
+    /// that borrow, which copied every title and body on every keystroke, on
+    /// every `j`/`k`, and on every write the API made.
     ///
     /// The narrowing itself lives in [`WorkingState`]; this only supplies the
     /// corpus, which is the one thing that module deliberately does not hold.
-    pub(super) fn visible_issues<'a>(&self, cx: &'a App) -> Vec<&'a Issue> {
-        self.working.visible(self.projection.read(cx).issues())
+    fn settling<R>(
+        &mut self,
+        cx: &App,
+        change: impl FnOnce(&mut WorkingState, &[Issue]) -> R,
+    ) -> R {
+        let projection = self.projection.clone();
+        change(&mut self.working, projection.read(cx).issues())
     }
 
     /// Every Tag carried by some Issue, sorted, first-spelling-wins.
@@ -499,12 +514,10 @@ impl IssueTracker {
         self.projection.read(cx).get(parent).cloned()
     }
 
-    /// One Issue's parts, borrowed. Used to roll up a Size per row.
-    pub(super) fn projection_sub_issues<'a>(&self, id: IssueId, cx: &'a App) -> Vec<&'a Issue> {
-        self.projection.read(cx).sub_issues(id)
-    }
-
     /// Settled-over-total for an Issue's parts, or `None` when it has none.
+    ///
+    /// One Issue's worth. The list asks the same question of every row at
+    /// once and goes through [`Projection::sub_issue_index`] instead.
     pub(super) fn settled_progress(&self, id: IssueId, cx: &App) -> Option<(usize, usize)> {
         self.projection.read(cx).settled_progress(id)
     }
@@ -517,8 +530,7 @@ impl IssueTracker {
     /// keeps them consistent: there is no separate "and the API also needs
     /// to…" path to forget about.
     fn on_projection_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let issues = self.projection_issues(cx);
-        let settled = self.working.settle(&issues);
+        let settled = self.settling(cx, |working, issues| working.settle(issues));
         self.refresh_inputs(settled.selection_moved, window, cx);
         cx.notify();
     }
@@ -612,8 +624,7 @@ impl IssueTracker {
     // ---- selection ----------------------------------------------------------
 
     pub(super) fn select_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
-        let issues = self.projection_issues(cx);
-        self.working.select_view(view, &issues);
+        self.settling(cx, |working, issues| working.select_view(view, issues));
         self.after_settling(true, window, cx);
         // The View menu carries a checkmark, so the tree has to be rebuilt
         // for it to follow the active View.
@@ -643,8 +654,7 @@ impl IssueTracker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let issues = self.projection_issues(cx);
-        self.working.toggle_tag(tag, &issues);
+        self.settling(cx, |working, issues| working.toggle_tag(tag, issues));
         self.after_settling(true, window, cx);
     }
 
@@ -653,8 +663,7 @@ impl IssueTracker {
         // `flush_pending_save` reads the selection to know what it is saving —
         // so it has to run before the selection moves, not after.
         self.flush_pending_save(cx);
-        let issues = self.projection_issues(cx);
-        let settled = self.working.move_selection(delta, &issues);
+        let settled = self.settling(cx, |working, issues| working.move_selection(delta, issues));
         self.after_settling(settled.selection_moved, window, cx);
     }
 

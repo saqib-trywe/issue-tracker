@@ -16,11 +16,13 @@ use issue_tracker::domain::{Narrowing, Tag, View};
 impl IssueTracker {
     pub(super) fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let active = self.working.view();
+        // Counted straight off the shared corpus. This used to clone every
+        // Issue, bodies included, to work out six integers — on every frame.
         let counts: Vec<(View, usize)> = {
-            let issues = self.projection_issues(cx);
+            let issues = self.projection(cx).issues();
             View::ALL
                 .into_iter()
-                .map(|view| (view, Narrowing::for_view(view).count(&issues)))
+                .map(|view| (view, Narrowing::for_view(view).count(issues)))
                 .collect()
         };
 

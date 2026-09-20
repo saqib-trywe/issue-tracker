@@ -142,12 +142,16 @@ fn list_issues(request: &Request, projection: &Projection) -> Response {
         parent,
     };
 
+    // Worked out once for the whole corpus rather than scanned for per Issue,
+    // which made a listing quadratic in the number of Issues it returned.
+    let sub_issues = projection.sub_issue_index();
+
     // `issues()` is already in display order, and narrowing preserves it, so
     // the API and the window agree on what "first" means.
     let issues: Vec<IssueJson> = narrowing
         .select(projection.issues())
         .into_iter()
-        .map(|issue| issue_json(projection, issue))
+        .map(|issue| IssueJson::new(issue, sub_issues.of_issue(issue.id)))
         .collect();
 
     Response::json(200, &issues)

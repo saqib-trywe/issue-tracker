@@ -169,6 +169,63 @@ impl IssuePatch {
     }
 }
 
+/// Settled-over-total for a set of parts, or `None` when there are none.
+///
+/// Free-standing so that [`Projection::settled_progress`] and
+/// [`SubIssues::settled_progress`] are the same answer reached two ways
+/// rather than two answers — the number beside a row and the number behind a
+/// disabled Done button have to agree.
+fn settled_progress(sub_issues: &[&Issue]) -> Option<(usize, usize)> {
+    if sub_issues.is_empty() {
+        return None;
+    }
+    let settled = sub_issues
+        .iter()
+        .filter(|issue| issue.status.is_settled())
+        .count();
+    Some((settled, sub_issues.len()))
+}
+
+/// Which Issues are part of which, worked out once.
+///
+/// An Issue does not know its own parts — that is a fact about the whole
+/// corpus, which is why [`Projection::sub_issues`] scans for them. Asking it
+/// per row makes a render quadratic in the number of Issues shown; this
+/// answers the same question for everything at once, in a single pass, and
+/// hands back borrows of the very same Issues.
+///
+/// Derived on demand and never stored, like [`crate::domain::SizeRollup`]: it
+/// borrows the corpus, so it cannot outlive a mutation and go stale.
+pub struct SubIssues<'a> {
+    by_parent: std::collections::HashMap<IssueId, Vec<&'a Issue>>,
+}
+
+impl<'a> SubIssues<'a> {
+    fn of(issues: &'a [Issue]) -> Self {
+        let mut by_parent: std::collections::HashMap<IssueId, Vec<&'a Issue>> =
+            std::collections::HashMap::new();
+        // One pass in the order given, which is display order, so each list
+        // comes out ordered exactly as `sub_issues` would have returned it.
+        for issue in issues {
+            if let Some(parent) = issue.parent_id {
+                by_parent.entry(parent).or_default().push(issue);
+            }
+        }
+        Self { by_parent }
+    }
+
+    /// One Issue's parts, in display order. Empty for an Issue that holds
+    /// nothing — the same answer [`Projection::sub_issues`] gives.
+    pub fn of_issue(&self, id: IssueId) -> &[&'a Issue] {
+        self.by_parent.get(&id).map_or(&[], Vec::as_slice)
+    }
+
+    /// Settled-over-total for one Issue's parts, or `None` when it has none.
+    pub fn settled_progress(&self, id: IssueId) -> Option<(usize, usize)> {
+        settled_progress(self.of_issue(id))
+    }
+}
+
 /// Every Issue, display-sorted, plus the database they came from.
 pub struct Projection {
     store: Store,
@@ -218,21 +275,24 @@ impl Projection {
             .collect()
     }
 
+    /// Every Issue's parts, in one pass.
+    ///
+    /// [`Self::sub_issues`] scans the corpus, which is the right answer for
+    /// one Issue and the wrong one for a list of them — a row that shows its
+    /// parts' progress and their Size turns a render into two scans per row,
+    /// so a window showing everything costs the square of what it shows.
+    /// This is that scan done once. See [`SubIssues`].
+    pub fn sub_issue_index(&self) -> SubIssues<'_> {
+        SubIssues::of(&self.issues)
+    }
+
     /// How many sub-issues are settled, and how many there are — the `2/3` on
     /// a parent's row. `None` when it has no sub-issues at all.
     ///
     /// Deliberately the same predicate the Done rule uses, so the number on
     /// screen explains the disabled button exactly.
     pub fn settled_progress(&self, id: IssueId) -> Option<(usize, usize)> {
-        let children = self.sub_issues(id);
-        if children.is_empty() {
-            return None;
-        }
-        let settled = children
-            .iter()
-            .filter(|issue| issue.status.is_settled())
-            .count();
-        Some((settled, children.len()))
+        settled_progress(&self.sub_issues(id))
     }
 
     fn outstanding_count(&self, id: IssueId) -> usize {
@@ -571,6 +631,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The index exists only to answer the scan's question faster. If the two
+    /// ever disagree, a row shows a different `2/3` and a different total from
+    /// the detail pane beside it — so they are checked against each other
+    /// rather than each against a hand-written expectation.
+    #[test]
+    fn the_index_answers_exactly_what_scanning_would() {
+        let mut p = projection();
+        let top = filed(&mut p, "top");
+        let other = filed(&mut p, "other");
+        let childless = filed(&mut p, "childless");
+        for title in ["a", "b", "c"] {
+            let child = filed(&mut p, title);
+            p.set_parent(child, Some(top)).unwrap();
+        }
+        let settled = filed(&mut p, "settled");
+        p.set_parent(settled, Some(other)).unwrap();
+        p.patch(settled, IssuePatch::default().status(Status::Done))
+            .unwrap();
+
+        let index = p.sub_issue_index();
+        for issue in p.issues() {
+            let scanned = p.sub_issues(issue.id);
+            assert_eq!(
+                index.of_issue(issue.id),
+                scanned.as_slice(),
+                "parts of #{}",
+                issue.id
+            );
+            assert_eq!(
+                index.settled_progress(issue.id),
+                p.settled_progress(issue.id),
+                "progress of #{}",
+                issue.id
+            );
+        }
+        assert!(index.of_issue(childless).is_empty());
+        assert_eq!(index.settled_progress(childless), None);
+        assert_eq!(index.settled_progress(top), Some((0, 3)));
+        assert_eq!(index.settled_progress(other), Some((1, 1)));
     }
 
     #[test]
