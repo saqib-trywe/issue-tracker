@@ -8,6 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Read `CONTEXT.md` for the domain vocabulary and `docs/adr/` for the decisions that shaped the architecture.
 
+The project is GPL-3.0-only (`COPYING`), with one exception: `.agents/skills/` is vendored from `mattpocock/skills` and stays MIT under its own `LICENSE` and `NOTICE.md`. `.claude/skills/` symlinks into it rather than copying, so there is one set of files to keep that true of.
+
 ## Commands
 
 - Build: `cargo build`
