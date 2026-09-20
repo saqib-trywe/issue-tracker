@@ -16,6 +16,7 @@ Read `CONTEXT.md` for the domain vocabulary and `docs/adr/` for the decisions th
 - Test: `cargo test`, single test with `cargo test <test_name>`
 - Format: `cargo fmt`
 - Lint: `cargo clippy`
+- CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings` and `test --workspace` on macOS. It is the same three commands as above; there is no remote configured yet, so nothing runs them until there is.
 - Run the CLI: `cargo run --bin issue -- list` (or `./target/debug/issue` after a build). `cargo install --path .` puts both `Issues` and `issue` on the PATH. The CLI needs the app running and honours `ISSUE_TRACKER_DB`, since that is how it finds `api.json`.
 - Run the MCP server: `cargo run -p issue-mcp`. It speaks JSON-RPC on stdin/stdout, so running it in a terminal looks like a hang — that is it waiting for a client. `cargo install --path crates/issue-mcp` puts it on the PATH; it is a *separate* install from `cargo install --path .`, because it is a workspace member.
 

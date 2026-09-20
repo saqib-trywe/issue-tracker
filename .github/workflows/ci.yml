@@ -1,0 +1,43 @@
+# The three commands CLAUDE.md prescribes, run where forgetting them is not an
+# option. Everything here already passes; the point is that it keeps passing.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A backtrace on a failing test is the difference between a red tick and a
+  # diagnosis.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    # macOS, because that is the platform this targets: the window lifecycle,
+    # the menu bar and the `0600` address file are all macOS behaviour, and a
+    # Linux runner would need GPUI's X11/Wayland build to say nothing useful.
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # `gpui` and `gpui-component` are built from git and dominate a cold
+      # build. Without a cache this job is mostly spent compiling Zed.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # `--all-targets` so tests are linted too, `-D warnings` because a
+      # warning nobody fails on is a warning nobody reads.
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
