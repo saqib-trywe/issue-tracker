@@ -22,6 +22,22 @@ enum Route {
     Tags,
 }
 
+/// The path template `docs/openapi.yaml` gives each route.
+///
+/// Exhaustive on purpose: a new route is a compile error here until it is
+/// named, and the test beside `openapi.yaml`'s paths then fails until the
+/// spec describes it too.
+#[cfg(test)]
+fn template(route: &Route) -> &'static str {
+    match route {
+        Route::Issues => "/issues",
+        Route::Issue(_) => "/issues/{id}",
+        Route::IssueTag(..) => "/issues/{id}/tags/{name}",
+        Route::IssueSubIssue(..) => "/issues/{parent}/sub-issues/{child}",
+        Route::Tags => "/tags",
+    }
+}
+
 fn route(path: &str) -> Option<Route> {
     match path {
         "/issues" => return Some(Route::Issues),
@@ -185,34 +201,15 @@ fn create_issue(request: &Request, projection: &mut Projection) -> Response {
         Err(err) => return Response::error(400, err),
     };
 
-    // Asked before anything is written. Every reason a parent could refuse
-    // this Issue is a fact about the parent, so it is knowable now — and
-    // checking afterwards meant answering 404 to a caller who had just been
-    // given an Issue they were never told about.
-    if let Some(parent) = new.parent_id {
-        let settled = patch.status.unwrap_or_default().is_settled();
-        if let Err(err) = projection.may_hold(parent, settled) {
-            return write_error(err);
-        }
-    }
-
-    let created = match projection.create(&title, patch) {
+    // One write, parent included: a refusing or missing parent is answered
+    // before anything exists, and a failure part-way leaves no Issue behind
+    // for the caller's retry to duplicate.
+    let created = match projection.create(&title, patch, new.parent_id) {
         Ok(issue) => issue,
         Err(err) => return write_error(err),
     };
 
-    // Still routed through `set_parent` so the attach goes through exactly the
-    // checks any other attach does. It cannot refuse now: the Issue is new, so
-    // it is neither its own parent nor holding anything, and the parent was
-    // asked above.
-    if let Some(parent) = new.parent_id
-        && let Err(err) = projection.set_parent(created.id, Some(parent))
-    {
-        return write_error(err);
-    }
-
-    let issue = projection.get(created.id).expect("just created");
-    Response::json(201, &issue_json(projection, issue))
+    Response::json(201, &issue_json(projection, &created))
         .with_header("Location", format!("/issues/{}", created.id))
 }
 
@@ -231,10 +228,19 @@ fn patch_issue(id: IssueId, request: &Request, projection: &mut Projection) -> R
             ),
         );
     }
-    let patch = match body.into_patch() {
+    let mut patch = match body.into_patch() {
         Ok(patch) => patch,
         Err(err) => return Response::error(400, err),
     };
+    // Held to the rule `POST` is. The window can blank a title, because
+    // auto-save lands while you delete one to retype it; nothing that comes
+    // through here is mid-keystroke.
+    if let Some(title) = patch.title.as_mut() {
+        *title = title.trim().to_string();
+        if title.is_empty() {
+            return Response::error(400, "title must not be blank");
+        }
+    }
 
     written(projection.patch(id, patch), projection)
 }
@@ -411,6 +417,23 @@ mod tests {
         assert_eq!(send(&mut p, "POST", "/issues", "{}").status, 400);
     }
 
+    /// The same rule by the other door. The window may hold a blank title
+    /// while you retype one, but nothing out here is mid-keystroke.
+    #[test]
+    fn a_title_cannot_be_patched_blank_and_is_trimmed_like_a_new_one() {
+        let mut p = projection();
+        let id = p.create("kept", IssuePatch::default(), None).unwrap().id;
+        let path = format!("/issues/{id}");
+
+        let blank = send(&mut p, "PATCH", &path, r#"{"title":"  "}"#);
+        assert_eq!(blank.status, 400);
+        assert_eq!(p.get(id).unwrap().title, "kept");
+
+        let padded = send(&mut p, "PATCH", &path, r#"{"title":"  renamed "}"#);
+        assert_eq!(padded.status, 200);
+        assert_eq!(p.get(id).unwrap().title, "renamed");
+    }
+
     /// The failure the CLI's `finish()` and the MCP server's
     /// `deny_unknown_fields` exist to prevent, at the surface both of them are
     /// clients of: a misspelt field answering 200 and changing nothing is the
@@ -478,7 +501,7 @@ mod tests {
     #[test]
     fn reading_one_issue_or_failing_to() {
         let mut p = projection();
-        let created = p.create("readable", IssuePatch::default()).unwrap();
+        let created = p.create("readable", IssuePatch::default(), None).unwrap();
 
         let found = send(&mut p, "GET", &format!("/issues/{}", created.id), "");
         assert_eq!(found.status, 200);
@@ -490,7 +513,7 @@ mod tests {
     #[test]
     fn a_patch_touches_only_what_it_names() {
         let mut p = projection();
-        let created = p.create("keep me", IssuePatch::default()).unwrap();
+        let created = p.create("keep me", IssuePatch::default(), None).unwrap();
 
         let response = send(
             &mut p,
@@ -507,7 +530,7 @@ mod tests {
     #[test]
     fn an_empty_patch_body_is_a_no_op_rather_than_an_error() {
         let mut p = projection();
-        let created = p.create("unchanged", IssuePatch::default()).unwrap();
+        let created = p.create("unchanged", IssuePatch::default(), None).unwrap();
         let response = send(&mut p, "PATCH", &format!("/issues/{}", created.id), "");
         assert_eq!(response.status, 200);
         assert_eq!(json(&response)["title"], "unchanged");
@@ -525,7 +548,7 @@ mod tests {
     #[test]
     fn deleting_is_204_then_404() {
         let mut p = projection();
-        let created = p.create("doomed", IssuePatch::default()).unwrap();
+        let created = p.create("doomed", IssuePatch::default(), None).unwrap();
         let path = format!("/issues/{}", created.id);
 
         let gone = send(&mut p, "DELETE", &path, "");
@@ -537,11 +560,12 @@ mod tests {
     #[test]
     fn listing_is_in_display_order() {
         let mut p = projection();
-        p.create("low", IssuePatch::default()).unwrap();
+        p.create("low", IssuePatch::default(), None).unwrap();
         let urgent = p
             .create(
                 "urgent",
                 IssuePatch::default().priority(crate::domain::Priority::Urgent),
+                None,
             )
             .unwrap();
 
@@ -557,9 +581,10 @@ mod tests {
             IssuePatch::default()
                 .status(Status::Doing)
                 .tags(vec!["Bug".parse().unwrap()]),
+            None,
         )
         .unwrap();
-        p.create("beta", IssuePatch::default().status(Status::Todo))
+        p.create("beta", IssuePatch::default().status(Status::Todo), None)
             .unwrap();
 
         let by_status = send(&mut p, "GET", "/issues?status=Doing", "");
@@ -707,7 +732,7 @@ mod tests {
     #[test]
     fn tags_are_added_and_removed_one_at_a_time() {
         let mut p = projection();
-        let created = p.create("taggable", IssuePatch::default()).unwrap();
+        let created = p.create("taggable", IssuePatch::default(), None).unwrap();
         let base = format!("/issues/{}/tags", created.id);
 
         let added = send(&mut p, "PUT", &format!("{base}/Bug"), "");
@@ -730,7 +755,7 @@ mod tests {
     #[test]
     fn a_tag_name_may_contain_slashes_and_spaces() {
         let mut p = projection();
-        let created = p.create("taggable", IssuePatch::default()).unwrap();
+        let created = p.create("taggable", IssuePatch::default(), None).unwrap();
         let base = format!("/issues/{}/tags", created.id);
 
         let slashed = send(&mut p, "PUT", &format!("{base}/ui/theme"), "");
@@ -746,7 +771,7 @@ mod tests {
     #[test]
     fn an_unusable_tag_name_is_a_400() {
         let mut p = projection();
-        let created = p.create("taggable", IssuePatch::default()).unwrap();
+        let created = p.create("taggable", IssuePatch::default(), None).unwrap();
         let response = send(
             &mut p,
             "PUT",
@@ -765,7 +790,7 @@ mod tests {
     // ---- sub-issues ---------------------------------------------------------
 
     fn make(p: &mut Projection, title: &str) -> crate::domain::IssueId {
-        p.create(title, IssuePatch::default()).unwrap().id
+        p.create(title, IssuePatch::default(), None).unwrap().id
     }
 
     #[test]
@@ -1089,11 +1114,13 @@ mod tests {
         p.create(
             "one",
             IssuePatch::default().tags(vec!["Bug".parse().unwrap()]),
+            None,
         )
         .unwrap();
         p.create(
             "two",
             IssuePatch::default().tags(vec!["bug".parse().unwrap(), "ui".parse().unwrap()]),
+            None,
         )
         .unwrap();
 
@@ -1102,5 +1129,110 @@ mod tests {
             json(&response),
             serde_json::json!([{"name":"Bug","count":2},{"name":"ui","count":1}])
         );
+    }
+
+    // ---- the spec -----------------------------------------------------------
+
+    /// Every path in `docs/openapi.yaml`, with the methods it documents.
+    ///
+    /// Read by hand rather than with a YAML parser: the spec is written by
+    /// hand in one consistent shape, and this is the only thing that reads it.
+    fn documented() -> Vec<(String, Vec<String>)> {
+        let spec = include_str!("../../docs/openapi.yaml");
+        let paths = spec
+            .split_once("\npaths:\n")
+            .expect("the spec has a paths section")
+            .1;
+        let mut documented: Vec<(String, Vec<String>)> = Vec::new();
+        for line in paths.lines() {
+            // The next top-level key ends the section.
+            if !line.is_empty() && !line.starts_with(' ') {
+                break;
+            }
+            if let Some(path) = line.strip_prefix("  /").and_then(|l| l.strip_suffix(':')) {
+                documented.push((format!("/{path}"), Vec::new()));
+            } else if let Some(method) = line.strip_prefix("    ").and_then(|l| l.strip_suffix(':'))
+                && METHODS.contains(&method.to_ascii_uppercase().as_str())
+            {
+                let (_, methods) = documented.last_mut().expect("a method under a path");
+                methods.push(method.to_ascii_uppercase());
+            }
+        }
+        documented
+    }
+
+    const METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+    /// A concrete path for a template, addressing things that exist.
+    fn instantiate(template: &str) -> String {
+        template
+            .replace("{id}", "1")
+            .replace("{parent}", "1")
+            .replace("{child}", "2")
+            // A slash inside, since a Tag name is the whole remainder.
+            .replace("{name}", "ui/theme")
+    }
+
+    /// The failure CLAUDE.md warns of: a route added to the code and not the
+    /// spec, or the other way about, and the spec quietly becoming fiction.
+    #[test]
+    fn the_openapi_spec_describes_exactly_the_routes_there_are() {
+        let documented = documented();
+        assert!(!documented.is_empty(), "no paths read from the spec");
+
+        // Every route is documented, and nothing documented is missing.
+        let witnesses = [
+            Route::Issues,
+            Route::Issue(1),
+            Route::IssueTag(1, "ui".into()),
+            Route::IssueSubIssue(1, 2),
+            Route::Tags,
+        ];
+        let mut in_code: Vec<&str> = witnesses.iter().map(template).collect();
+        let mut in_spec: Vec<&str> = documented.iter().map(|(path, _)| path.as_str()).collect();
+        in_code.sort_unstable();
+        in_spec.sort_unstable();
+        assert_eq!(in_code, in_spec, "routes in the code vs paths in the spec");
+
+        for (template_path, methods) in &documented {
+            let path = instantiate(template_path);
+            let reached = route(&path).unwrap_or_else(|| panic!("{path} reaches no route"));
+            assert_eq!(
+                template(&reached),
+                template_path,
+                "{path} reached another route"
+            );
+
+            for method in METHODS {
+                // Fresh each time, so a DELETE cannot change what the next
+                // method finds.
+                let mut p = projection();
+                let parent = p.create("parent", IssuePatch::default(), None).unwrap().id;
+                let child = p.create("child", IssuePatch::default(), None).unwrap().id;
+                assert_eq!((parent, child), (1, 2));
+
+                let response = send(&mut p, method, &path, "");
+                let allowed = methods.iter().any(|documented| documented == method);
+                assert_eq!(
+                    response.status != 405,
+                    allowed,
+                    "{method} {template_path}: the spec says {}, the code answered {}",
+                    if allowed { "allowed" } else { "not allowed" },
+                    response.status,
+                );
+                if response.status == 405 {
+                    let (_, allow) = response
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name == "Allow")
+                        .expect("a 405 says what is allowed");
+                    let mut allow: Vec<&str> = allow.split(", ").collect();
+                    let mut documented: Vec<&str> = methods.iter().map(String::as_str).collect();
+                    allow.sort_unstable();
+                    documented.sort_unstable();
+                    assert_eq!(allow, documented, "the Allow header on {template_path}");
+                }
+            }
+        }
     }
 }

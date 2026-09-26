@@ -30,6 +30,13 @@ info:
     client that sends one is told what went wrong instead of being told its
     `title` was missing.
 
+    Any request may be answered `503` without being attempted: when more than
+    sixteen connections are already open, when the app is quitting, or when
+    the window's thread has not got to it within thirty seconds. A `503`
+    always means **nothing was changed**, so it is safe to retry. A request
+    the app has started on is always answered with its real outcome, however
+    long that takes.
+
     ## Finding the server
 
     The port and token are published to `api.json`, beside the database, mode
@@ -151,7 +158,9 @@ paths:
         means "no parent", which is the ambiguity that keeps it out of `PATCH`.
         Every reason a parent could refuse is a fact about the parent, so it is
         checked *before* anything is written: a refused create files nothing,
-        and a retry cannot leave two Issues behind.
+        and a retry cannot leave two Issues behind. The Issue, its Tags and its
+        parent are then one write, so a create that fails part-way files
+        nothing either.
 
         A field this endpoint does not know is refused rather than ignored. A
         misspelt one answering `201` and quietly dropping what it carried is
@@ -280,8 +289,9 @@ paths:
                 $ref: '#/components/schemas/Issue'
         '400':
           description: >
-            An unknown Status or Priority, an unusable Tag name, a field this
-            endpoint does not know, a malformed body, or `parent_id` — which
+            A blank title, an unknown Status or Priority, an unusable Tag
+            name, a field this endpoint does not know, a malformed body, or
+            `parent_id` — which
             is refused with a pointer to the sub-issue endpoints rather than
             ignored, since a caller who thought they had moved an Issue would
             otherwise have no way to tell they had not.
@@ -741,6 +751,7 @@ components:
       properties:
         title:
           type: string
+          description: Trimmed. Must not be blank, as at creation.
         body:
           type: string
         status:
